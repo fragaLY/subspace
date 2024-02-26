@@ -46,7 +46,7 @@ services:
         "--node-rpc-url", "ws://node:9944",
         "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
         "--listen-on", "/ip4/0.0.0.0/tcp/30533",
-        "--reward-address", "st6GBwATPqtBkK5y4uXbV52euszPpFPw7wmkF8FywEqJaf8uP",
+        "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L",
         "path=/var/subspace,size=100G"
       ]
 
@@ -67,7 +67,7 @@ services:
         "--node-rpc-url", "ws://node:9944",
         "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
         "--listen-on", "/ip4/0.0.0.0/tcp/30533",
-        "--reward-address", "st6GBwATPqtBkK5y4uXbV52euszPpFPw7wmkF8FywEqJaf8uP",
+        "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L",
         "path=/var/subspace,size=100G"
       ]
 
@@ -88,7 +88,7 @@ services:
         "--node-rpc-url", "ws://node:9944",
         "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
         "--listen-on", "/ip4/0.0.0.0/tcp/30533",
-        "--reward-address", "st6GBwATPqtBkK5y4uXbV52euszPpFPw7wmkF8FywEqJaf8uP",
+        "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L",
         "path=/var/subspace,size=100G"
       ]
 
