@@ -1,0 +1,82 @@
+FROM ubuntu:20.04
+
+ARG RUSTC_VERSION=nightly-2024-01-19
+ARG PROFILE=production
+
+# Set Rust flags to ensure compatibility with older CPUs such as Xeon E5
+ARG RUSTFLAGS="-C target-cpu=x86-64 -C target-feature=+sse2,-sse4.1,-avx,-avx2"
+
+# Workaround for https://github.com/rust-lang/cargo/issues/10583
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+# Incremental compilation here isn't helpful
+ENV CARGO_INCREMENTAL=0
+# Apply the custom Rust flags
+ENV RUSTFLAGS="${RUSTFLAGS}"
+
+WORKDIR /code
+
+RUN \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        protobuf-compiler \
+        curl \
+        git \
+        llvm \
+        clang \
+        automake \
+        libtool \
+        pkg-config \
+        make && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $RUSTC_VERSION
+
+RUN /root/.cargo/bin/rustup target add wasm32-unknown-unknown
+
+COPY .git /code/.git
+COPY .cargo /code/.cargo
+COPY Cargo.lock /code/Cargo.lock
+COPY Cargo.toml /code/Cargo.toml
+COPY rust-toolchain.toml /code/rust-toolchain.toml
+
+COPY crates /code/crates
+COPY domains /code/domains
+COPY orml /code/orml
+COPY shared /code/shared
+COPY test /code/test
+
+# Up until this line all Rust images in this repo should be the same to share the same layers
+
+ARG SUBSTRATE_CLI_GIT_COMMIT_HASH
+
+RUN \
+    /root/.cargo/bin/cargo -Zgitoxide -Zgit build \
+        --locked \
+        -Z build-std \
+        --profile $PROFILE \
+        --bin subspace-node \
+        --target $TARGET_ARCH && \
+    mv target/$(uname -m)/$PROFILE/subspace-node subspace-node && \
+    rm -rf target
+
+FROM ubuntu:20.04
+
+RUN \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+HEALTHCHECK CMD curl \
+                  -H "Content-Type: application/json" \
+                  -d '{ "id": 1, "jsonrpc": "2.0", "method": "system_health", "params": [] }' \
+                  -f "http://localhost:9944"
+
+COPY --from=0 /code/subspace-node /subspace-node
+
+RUN mkdir /var/subspace && chown nobody:nogroup /var/subspace
+
+VOLUME /var/subspace
+
+USER nobody:nogroup
+
+ENTRYPOINT ["/subspace-node"]

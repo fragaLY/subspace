@@ -1,0 +1,100 @@
+version: "3.7"
+services:
+  node:
+    image: fragaly/subspace-node-oc:0.1.1
+    volumes:
+      - node-data:/var/subspace:rw
+    ports:
+      - "0.0.0.0:30333:30333/udp"
+      - "0.0.0.0:30333:30333/tcp"
+      - "0.0.0.0:30433:30433/udp"
+      - "0.0.0.0:30433:30433/tcp"
+    restart: unless-stopped
+    command:
+      [
+        "run",
+        "--chain", "gemini-3h",
+        "--base-path", "/var/subspace",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30333",
+        "--dsn-listen-on", "/ip4/0.0.0.0/udp/30433/quic-v1",
+        "--dsn-listen-on", "/ip4/0.0.0.0/tcp/30433",
+        "--rpc-cors", "all",
+        "--rpc-methods", "unsafe",
+        "--rpc-listen-on", "0.0.0.0:9944",
+        "--farmer",
+        "--name", "subspace"
+      ]
+    healthcheck:
+      timeout: 5s
+      interval: 30s
+      retries: 60
+
+  farmer-1:
+    depends_on:
+      node:
+        condition: service_healthy
+    image: fragaly/subspace-farmer-oc:0.1.1
+    volumes:
+      - farmer-data-1:/var/subspace:rw
+    ports:
+      - "0.0.0.0:30533:30533/udp"
+      - "0.0.0.0:30533:30533/tcp"
+    restart: unless-stopped
+    command:
+      [
+        "farm",
+        "--node-rpc-url", "ws://node:9944",
+        "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30533",
+        "--reward-address", "st6GBwATPqtBkK5y4uXbV52euszPpFPw7wmkF8FywEqJaf8uP",
+        "path=/var/subspace,size=100G"
+      ]
+
+  farmer-2:
+    depends_on:
+      node:
+        condition: service_healthy
+    image: fragaly/subspace-farmer-oc:0.1.1
+    volumes:
+      - farmer-data-2:/var/subspace:rw
+    ports:
+      - "0.0.0.0:30533:30533/udp"
+      - "0.0.0.0:30533:30533/tcp"
+    restart: unless-stopped
+    command:
+      [
+        "farm",
+        "--node-rpc-url", "ws://node:9944",
+        "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30533",
+        "--reward-address", "st6GBwATPqtBkK5y4uXbV52euszPpFPw7wmkF8FywEqJaf8uP",
+        "path=/var/subspace,size=100G"
+      ]
+
+  farmer-3:
+    depends_on:
+      node:
+        condition: service_healthy
+    image: fragaly/subspace-farmer-oc:0.1.1
+    volumes:
+      - farmer-data-3:/var/subspace:rw
+    ports:
+      - "0.0.0.0:30533:30533/udp"
+      - "0.0.0.0:30533:30533/tcp"
+    restart: unless-stopped
+    command:
+      [
+        "farm",
+        "--node-rpc-url", "ws://node:9944",
+        "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30533",
+        "--reward-address", "st6GBwATPqtBkK5y4uXbV52euszPpFPw7wmkF8FywEqJaf8uP",
+        "path=/var/subspace,size=100G"
+      ]
+
+
+volumes:
+  node-data:
+  farmer-data-1:
+  farmer-data-2:
+  farmer-data-3:
