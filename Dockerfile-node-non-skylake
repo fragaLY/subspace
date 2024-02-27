@@ -4,7 +4,7 @@ ARG RUSTC_VERSION=nightly-2024-01-19
 ARG PROFILE=production
 
 # Set Rust flags to ensure compatibility with older CPUs such as Xeon E5
-ARG RUSTFLAGS="-C target-cpu=x86-64 -C target-feature=+sse2,-sse4.1,-avx,-avx2"
+ARG RUSTFLAGS="-C target-cpu=x86-64 -C target-feature=+sse2,-sse4.1,-avx,-avx2 -C lto=thin"
 
 # Workaround for https://github.com/rust-lang/cargo/issues/10583
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
@@ -12,6 +12,7 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 ENV CARGO_INCREMENTAL=0
 # Apply the custom Rust flags
 ENV RUSTFLAGS="${RUSTFLAGS}"
+ARG TARGET_ARCH=x86_64-unknown-linux-gnu
 
 WORKDIR /code
 
@@ -30,9 +31,10 @@ RUN \
         make && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $RUSTC_VERSION
 
-RUN /root/.cargo/bin/rustup target add wasm32-unknown-unknown
+RUN \
+    /root/.cargo/bin/rustup target add wasm32-unknown-unknown && \
+    /root/.cargo/bin/rustup target add ${TARGET_ARCH}  # Ensure the target is added to rustup
 
-COPY .git /code/.git
 COPY .cargo /code/.cargo
 COPY Cargo.lock /code/Cargo.lock
 COPY Cargo.toml /code/Cargo.toml
@@ -55,7 +57,7 @@ RUN \
         --profile $PROFILE \
         --bin subspace-node \
         --target $TARGET_ARCH && \
-    mv target/$(uname -m)/$PROFILE/subspace-node subspace-node && \
+    mv target/$TARGET_ARCH/$PROFILE/subspace-node subspace-node && \
     rm -rf target
 
 FROM ubuntu:20.04

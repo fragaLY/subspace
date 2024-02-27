@@ -2,11 +2,13 @@ FROM ubuntu:20.04
 
 ARG RUSTC_VERSION=nightly-2024-01-19
 ARG PROFILE=production
-ARG RUSTFLAGS
+ARG RUSTFLAGS="-C target-cpu=x86-64 -C target-feature=+sse2,-sse4.1,-avx,-avx2"
 # Workaround for https://github.com/rust-lang/cargo/issues/10583
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 # Incremental compilation here isn't helpful
 ENV CARGO_INCREMENTAL=0
+ENV RUSTFLAGS="${RUSTFLAGS}"
+ARG TARGET_ARCH=x86_64-unknown-linux-gnu
 
 WORKDIR /code
 
@@ -25,7 +27,9 @@ RUN \
         make && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $RUSTC_VERSION
 
-RUN /root/.cargo/bin/rustup target add wasm32-unknown-unknown
+RUN \
+    /root/.cargo/bin/rustup target add wasm32-unknown-unknown && \
+    /root/.cargo/bin/rustup target add ${TARGET_ARCH}
 
 COPY .cargo /code/.cargo
 COPY Cargo.lock /code/Cargo.lock
@@ -48,7 +52,7 @@ RUN \
         -Z build-std \
         --profile $PROFILE \
         --bin subspace-node \
-        --target $(uname -p)-unknown-linux-gnu && \
+        --target $TARGET_ARCH && \
     mv target/*/*/subspace-node subspace-node && \
     rm -rf target
 
