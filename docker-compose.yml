@@ -58,15 +58,15 @@ services:
     volumes:
       - farmer-data-2:/var/subspace:rw
     ports:
-      - "0.0.0.0:30533:30533/udp"
-      - "0.0.0.0:30533:30533/tcp"
+      - "0.0.0.0:30534:30534/udp"
+      - "0.0.0.0:30534:30534/tcp"
     restart: unless-stopped
     command:
       [
         "farm",
         "--node-rpc-url", "ws://node:9944",
-        "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
-        "--listen-on", "/ip4/0.0.0.0/tcp/30533",
+        "--listen-on", "/ip4/0.0.0.0/udp/30534/quic-v1",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30534",
         "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L",
         "path=/var/subspace,size=100G"
       ]
@@ -79,15 +79,15 @@ services:
     volumes:
       - farmer-data-3:/var/subspace:rw
     ports:
-      - "0.0.0.0:30533:30533/udp"
-      - "0.0.0.0:30533:30533/tcp"
+      - "0.0.0.0:30535:30535/udp"
+      - "0.0.0.0:30535:30535/tcp"
     restart: unless-stopped
     command:
       [
         "farm",
         "--node-rpc-url", "ws://node:9944",
-        "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
-        "--listen-on", "/ip4/0.0.0.0/tcp/30533",
+        "--listen-on", "/ip4/0.0.0.0/udp/30535/quic-v1",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30535",
         "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L",
         "path=/var/subspace,size=100G"
       ]
