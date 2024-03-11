@@ -1,9 +1,10 @@
 version: "3.7"
 services:
-  node:
-    image: fragaly/subspace-node-oc:0.1.1
+
+  node-1:
+    image: fragaly/subspace-node-oc:0.1.2
     volumes:
-      - node-data:/var/subspace:rw
+      - node-data-1:/var/subspace:rw
     ports:
       - "0.0.0.0:30333:30333/udp"
       - "0.0.0.0:30333:30333/tcp"
@@ -29,11 +30,69 @@ services:
       interval: 30s
       retries: 60
 
+  node-2:
+    image: fragaly/subspace-node-oc:0.1.2
+    volumes:
+      - node-data-1:/var/subspace:rw
+    ports:
+      - "0.0.0.0:30334:30333/udp"
+      - "0.0.0.0:30334:30333/tcp"
+      - "0.0.0.0:30434:30433/udp"
+      - "0.0.0.0:30434:30433/tcp"
+    restart: unless-stopped
+    command:
+      [
+        "run",
+        "--chain", "gemini-3h",
+        "--base-path", "/var/subspace",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30333",
+        "--dsn-listen-on", "/ip4/0.0.0.0/udp/30433/quic-v1",
+        "--dsn-listen-on", "/ip4/0.0.0.0/tcp/30433",
+        "--rpc-cors", "all",
+        "--rpc-methods", "unsafe",
+        "--rpc-listen-on", "0.0.0.0:9944",
+        "--farmer",
+        "--name", "subspace"
+      ]
+    healthcheck:
+      timeout: 5s
+      interval: 30s
+      retries: 60
+
+  node-3:
+    image: fragaly/subspace-node-oc:0.1.2
+    volumes:
+      - node-data-1:/var/subspace:rw
+    ports:
+      - "0.0.0.0:30335:30333/udp"
+      - "0.0.0.0:30335:30333/tcp"
+      - "0.0.0.0:30435:30433/udp"
+      - "0.0.0.0:30435:30433/tcp"
+    restart: unless-stopped
+    command:
+      [
+        "run",
+        "--chain", "gemini-3h",
+        "--base-path", "/var/subspace",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30333",
+        "--dsn-listen-on", "/ip4/0.0.0.0/udp/30433/quic-v1",
+        "--dsn-listen-on", "/ip4/0.0.0.0/tcp/30433",
+        "--rpc-cors", "all",
+        "--rpc-methods", "unsafe",
+        "--rpc-listen-on", "0.0.0.0:9944",
+        "--farmer",
+        "--name", "subspace"
+      ]
+    healthcheck:
+      timeout: 5s
+      interval: 30s
+      retries: 60
+
   farmer-1:
     depends_on:
       node:
         condition: service_healthy
-    image: fragaly/subspace-farmer-oc:0.1.1
+    image: fragaly/subspace-farmer-oc:0.1.2
     volumes:
       - farmer-data-1:/var/subspace:rw
     ports:
@@ -43,7 +102,7 @@ services:
     command:
       [
         "farm",
-        "--node-rpc-url", "ws://node:9944",
+        "--node-rpc-url", "ws://node-1:9944",
         "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
         "--listen-on", "/ip4/0.0.0.0/tcp/30533",
         "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L",
@@ -54,19 +113,19 @@ services:
     depends_on:
       node:
         condition: service_healthy
-    image: fragaly/subspace-farmer-oc:0.1.1
+    image: fragaly/subspace-farmer-oc:0.1.2
     volumes:
       - farmer-data-2:/var/subspace:rw
     ports:
-      - "0.0.0.0:30534:30534/udp"
-      - "0.0.0.0:30534:30534/tcp"
+      - "0.0.0.0:30534:30533/udp"
+      - "0.0.0.0:30534:30533/tcp"
     restart: unless-stopped
     command:
       [
         "farm",
-        "--node-rpc-url", "ws://node:9944",
-        "--listen-on", "/ip4/0.0.0.0/udp/30534/quic-v1",
-        "--listen-on", "/ip4/0.0.0.0/tcp/30534",
+        "--node-rpc-url", "ws://node-2:9944",
+        "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30533",
         "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L",
         "path=/var/subspace,size=100G"
       ]
@@ -75,26 +134,28 @@ services:
     depends_on:
       node:
         condition: service_healthy
-    image: fragaly/subspace-farmer-oc:0.1.1
+    image: fragaly/subspace-farmer-oc:0.1.2
     volumes:
       - farmer-data-3:/var/subspace:rw
     ports:
-      - "0.0.0.0:30535:30535/udp"
-      - "0.0.0.0:30535:30535/tcp"
+      - "0.0.0.0:30535:30533/udp"
+      - "0.0.0.0:30535:30533/tcp"
     restart: unless-stopped
     command:
       [
         "farm",
-        "--node-rpc-url", "ws://node:9944",
-        "--listen-on", "/ip4/0.0.0.0/udp/30535/quic-v1",
-        "--listen-on", "/ip4/0.0.0.0/tcp/30535",
+        "--node-rpc-url", "ws://node-3:9944",
+        "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30533",
         "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L",
         "path=/var/subspace,size=100G"
       ]
 
 
 volumes:
-  node-data:
+  node-data-1:
+  node-data-2:
+  node-data-3:
   farmer-data-1:
   farmer-data-2:
   farmer-data-3:

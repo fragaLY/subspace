@@ -1,6 +1,6 @@
 FROM ubuntu:20.04
 
-ARG RUSTC_VERSION=nightly-2024-01-19
+ARG RUSTC_VERSION=nightly-2024-02-29
 ARG PROFILE=production
 
 # Set Rust flags to ensure compatibility with older CPUs such as Xeon E5
