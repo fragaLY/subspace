@@ -7,7 +7,7 @@ use crate::mock::{
 };
 use crate::{
     Channel, ChannelId, ChannelState, Channels, Error, FeeModel, Inbox, InboxResponses, Nonce,
-    Outbox, OutboxMessageResult, OutboxResponses, U256,
+    Outbox, OutboxMessageResult, OutboxResponses, Pallet, U256,
 };
 use frame_support::{assert_err, assert_ok};
 use pallet_transporter::Location;
@@ -16,10 +16,12 @@ use sp_core::{Blake2Hasher, H256};
 use sp_domains::proof_provider_and_verifier::{StorageProofVerifier, VerificationError};
 use sp_messenger::endpoint::{Endpoint, EndpointPayload, EndpointRequest, Sender};
 use sp_messenger::messages::{
-    BlockInfo, ChainId, CrossDomainMessage, InitiateChannelParams, Payload, Proof,
-    ProtocolMessageRequest, RequestResponse, VersionedPayload,
+    ChainId, ConsensusChainMmrLeafProof, CrossDomainMessage, InitiateChannelParams,
+    MessageWeightTag, Payload, Proof, ProtocolMessageRequest, RequestResponse, VersionedPayload,
 };
-use sp_runtime::traits::{Convert, ValidateUnsigned};
+use sp_mmr_primitives::{EncodableOpaqueLeaf, Proof as MmrProof};
+use sp_runtime::traits::Convert;
+use sp_trie::StorageProof;
 
 fn create_channel(chain_id: ChainId, channel_id: ChannelId, fee_model: FeeModel<Balance>) {
     let params = InitiateChannelParams {
@@ -74,6 +76,18 @@ fn create_channel(chain_id: ChainId, channel_id: ChannelId, fee_model: FeeModel<
     let expected_key =
         Outbox::<chain_a::Runtime>::hashed_key_for((chain_id, channel_id, Nonce::zero()));
     assert_eq!(messages_with_keys.outbox[0].storage_key, expected_key);
+}
+
+fn default_consensus_proof() -> ConsensusChainMmrLeafProof<H256, H256> {
+    ConsensusChainMmrLeafProof {
+        consensus_block_hash: Default::default(),
+        opaque_mmr_leaf: EncodableOpaqueLeaf(vec![]),
+        proof: MmrProof {
+            leaf_indices: vec![],
+            leaf_count: 0,
+            items: vec![],
+        },
+    }
 }
 
 fn close_channel(chain_id: ChainId, channel_id: ChannelId, last_delivered_nonce: Option<Nonce>) {
@@ -182,19 +196,13 @@ fn test_storage_proof_verification_invalid() {
         assert_ok!(Messenger::do_open_channel(chain_id, channel_id));
     });
 
-    let (_, _, storage_proof) =
+    let (_, storage_key, storage_proof) =
         crate::mock::storage_proof_of_channels::<Runtime>(t.as_backend(), chain_id, channel_id);
-    let proof: Proof<u64, H256, _> = Proof {
-        consensus_chain_block_info: BlockInfo::default(),
-        consensus_chain_state_root: Default::default(),
-        domain_proof: None,
-        message_proof: storage_proof,
-    };
     let res: Result<Channel<Balance>, VerificationError> =
         StorageProofVerifier::<Blake2Hasher>::get_decoded_value(
-            &proof.consensus_chain_state_root,
-            proof.message_proof,
-            StorageKey(vec![]),
+            &H256::zero(),
+            storage_proof,
+            storage_key,
         );
     assert_err!(res, VerificationError::InvalidProof);
 }
@@ -209,19 +217,13 @@ fn test_storage_proof_verification_missing_value() {
         assert_ok!(Messenger::do_open_channel(chain_id, channel_id));
     });
 
-    let (state_root, storage_key, storage_proof) =
+    let (state_root, _, storage_proof) =
         crate::mock::storage_proof_of_channels::<Runtime>(t.as_backend(), chain_id, U256::one());
-    let proof: Proof<u64, H256, _> = Proof {
-        consensus_chain_block_info: BlockInfo::default(),
-        consensus_chain_state_root: state_root,
-        domain_proof: None,
-        message_proof: storage_proof,
-    };
     let res: Result<Channel<Balance>, VerificationError> =
         StorageProofVerifier::<Blake2Hasher>::get_decoded_value(
-            &proof.consensus_chain_state_root,
-            proof.message_proof,
-            storage_key,
+            &state_root,
+            storage_proof,
+            StorageKey(vec![]),
         );
     assert_err!(res, VerificationError::MissingValue);
 }
@@ -240,16 +242,10 @@ fn test_storage_proof_verification() {
 
     let (state_root, storage_key, storage_proof) =
         crate::mock::storage_proof_of_channels::<Runtime>(t.as_backend(), chain_id, channel_id);
-    let proof: Proof<u64, H256, _> = Proof {
-        consensus_chain_block_info: BlockInfo::default(),
-        consensus_chain_state_root: state_root,
-        domain_proof: None,
-        message_proof: storage_proof,
-    };
     let res: Result<Channel<Balance>, VerificationError> =
         StorageProofVerifier::<Blake2Hasher>::get_decoded_value(
-            &proof.consensus_chain_state_root,
-            proof.message_proof,
+            &state_root,
+            storage_proof,
             storage_key,
         );
 
@@ -277,6 +273,9 @@ fn open_channel_between_chains(
         chain_b_test_ext,
         channel_id,
         Nonce::zero(),
+        true,
+        MessageWeightTag::ProtocolChannelOpen,
+        None,
     );
 
     // check channel state be open on chain_b
@@ -353,13 +352,6 @@ fn send_message_between_chains(
             },
         );
         assert_ok!(resp);
-        chain_a::System::assert_last_event(RuntimeEvent::Messenger(
-            crate::Event::<Runtime>::OutboxMessage {
-                chain_id: chain_b_id,
-                channel_id,
-                nonce: Nonce::one(),
-            },
-        ));
     });
 
     channel_relay_request_and_response(
@@ -367,6 +359,9 @@ fn send_message_between_chains(
         chain_b_test_ext,
         channel_id,
         Nonce::one(),
+        false,
+        Default::default(),
+        Some(Endpoint::Id(0)),
     );
 
     // check state on chain_b
@@ -414,6 +409,9 @@ fn close_channel_between_chains(
         chain_b_test_ext,
         channel_id,
         Nonce::one(),
+        true,
+        MessageWeightTag::ProtocolChannelClose,
+        None,
     );
 
     // check channel state be close on chain_b
@@ -471,17 +469,53 @@ fn close_channel_between_chains(
     })
 }
 
+fn force_toggle_channel_state<Runtime: crate::Config>(
+    dst_chain_id: ChainId,
+    channel_id: ChannelId,
+    toggle: bool,
+) {
+    let fee_model = FeeModel {
+        relay_fee: Default::default(),
+    };
+    let init_params = InitiateChannelParams {
+        max_outgoing_messages: 100,
+        fee_model,
+    };
+
+    let channel = Pallet::<Runtime>::channels(dst_chain_id, channel_id).unwrap_or_else(|| {
+        Pallet::<Runtime>::do_init_channel(dst_chain_id, init_params).unwrap();
+        Pallet::<Runtime>::channels(dst_chain_id, channel_id).unwrap()
+    });
+
+    if !toggle {
+        return;
+    }
+
+    if channel.state == ChannelState::Initiated {
+        Pallet::<Runtime>::do_open_channel(dst_chain_id, channel_id).unwrap();
+    }
+
+    if channel.state == ChannelState::Open {
+        Pallet::<Runtime>::do_close_channel(dst_chain_id, channel_id).unwrap();
+    }
+}
+
 fn channel_relay_request_and_response(
     chain_a_test_ext: &mut TestExternalities,
     chain_b_test_ext: &mut TestExternalities,
     channel_id: ChannelId,
     nonce: Nonce,
+    toggle_channel_state: bool,
+    weight_tag: MessageWeightTag,
+    maybe_endpoint: Option<Endpoint>,
 ) {
     let chain_a_id = chain_a::SelfChainId::get();
     let chain_b_id = chain_b::SelfChainId::get();
 
     // relay message to chain_b
-    let (state_root, _key, message_proof) = storage_proof_of_outbox_messages::<chain_a::Runtime>(
+    let msg = chain_a_test_ext
+        .execute_with(|| Outbox::<chain_a::Runtime>::get((chain_b_id, channel_id, nonce)).unwrap());
+    let (_state_root, _key, message_proof) = storage_proof_of_outbox_messages::<chain_a::Runtime>(
         chain_a_test_ext.as_backend(),
         chain_b_id,
         channel_id,
@@ -493,33 +527,27 @@ fn channel_relay_request_and_response(
         dst_chain_id: chain_b_id,
         channel_id,
         nonce,
-        proof: Proof {
-            consensus_chain_block_info: BlockInfo::default(),
-            consensus_chain_state_root: state_root,
-            domain_proof: None,
+        proof: Proof::Domain {
+            consensus_chain_mmr_proof: default_consensus_proof(),
+            domain_proof: StorageProof::empty(),
             message_proof,
         },
-        weight_tag: Default::default(),
+        weight_tag: maybe_endpoint
+            .clone()
+            .map(MessageWeightTag::EndpointRequest)
+            .unwrap_or(weight_tag.clone()),
     };
     chain_b_test_ext.execute_with(|| {
-        // validate the message
-        let pre_check =
-            crate::Pallet::<chain_b::Runtime>::pre_dispatch(&crate::Call::relay_message {
-                msg: xdm.clone(),
-            });
-        assert_ok!(pre_check);
+        force_toggle_channel_state::<chain_b::Runtime>(
+            chain_a_id,
+            channel_id,
+            toggle_channel_state,
+        );
+        Inbox::<chain_b::Runtime>::set(Some(msg));
 
         // process inbox message
         let result = chain_b::Messenger::relay_message(chain_b::RuntimeOrigin::none(), xdm);
         assert_ok!(result);
-
-        chain_b::System::assert_has_event(chain_b::RuntimeEvent::Messenger(crate::Event::<
-            chain_b::Runtime,
-        >::InboxMessage {
-            chain_id: chain_a_id,
-            channel_id,
-            nonce,
-        }));
 
         chain_b::System::assert_has_event(chain_b::RuntimeEvent::Messenger(crate::Event::<
             chain_b::Runtime,
@@ -539,7 +567,7 @@ fn channel_relay_request_and_response(
     });
 
     // relay message response to chain_a
-    let (state_root, _key, message_proof) =
+    let (_state_root, _key, message_proof) =
         storage_proof_of_inbox_message_responses::<chain_b::Runtime>(
             chain_b_test_ext.as_backend(),
             chain_a_id,
@@ -547,26 +575,31 @@ fn channel_relay_request_and_response(
             nonce,
         );
 
+    let msg = chain_b_test_ext.execute_with(|| {
+        InboxResponses::<chain_b::Runtime>::get((chain_a_id, channel_id, nonce)).unwrap()
+    });
+
     let xdm = CrossDomainMessage {
         src_chain_id: chain_b_id,
         dst_chain_id: chain_a_id,
         channel_id,
         nonce,
-        proof: Proof {
-            consensus_chain_block_info: BlockInfo::default(),
-            consensus_chain_state_root: state_root,
-            domain_proof: None,
+        proof: Proof::Consensus {
+            consensus_chain_mmr_proof: default_consensus_proof(),
             message_proof,
         },
-        weight_tag: Default::default(),
+        weight_tag: maybe_endpoint
+            .clone()
+            .map(MessageWeightTag::EndpointResponse)
+            .unwrap_or(weight_tag),
     };
     chain_a_test_ext.execute_with(|| {
-        // validate message response
-        let pre_check =
-            crate::Pallet::<chain_a::Runtime>::pre_dispatch(&crate::Call::relay_message_response {
-                msg: xdm.clone(),
-            });
-        assert_ok!(pre_check);
+        force_toggle_channel_state::<chain_a::Runtime>(
+            chain_b_id,
+            channel_id,
+            toggle_channel_state,
+        );
+        OutboxResponses::<chain_a::Runtime>::set(Some(msg));
 
         // process outbox message response
         let result =
@@ -592,7 +625,6 @@ fn channel_relay_request_and_response(
 }
 
 #[test]
-#[ignore]
 fn test_open_channel_between_chains() {
     let mut chain_a_test_ext = chain_a::new_test_ext();
     let mut chain_b_test_ext = chain_b::new_test_ext();
@@ -606,7 +638,6 @@ fn test_open_channel_between_chains() {
 }
 
 #[test]
-#[ignore]
 fn test_close_channel_between_chains() {
     let mut chain_a_test_ext = chain_a::new_test_ext();
     let mut chain_b_test_ext = chain_b::new_test_ext();
@@ -623,7 +654,6 @@ fn test_close_channel_between_chains() {
 }
 
 #[test]
-#[ignore]
 fn test_send_message_between_chains() {
     let mut chain_a_test_ext = chain_a::new_test_ext();
     let mut chain_b_test_ext = chain_b::new_test_ext();
@@ -671,11 +701,6 @@ fn initiate_transfer_on_chain(chain_a_ext: &mut TestExternalities) {
             channel_id: U256::zero(),
             nonce: U256::one(),
         }));
-        let fee_model = chain_b::Messenger::channels(chain_b::SelfChainId::get(), U256::zero())
-            .unwrap_or_default()
-            .fee;
-        let fees = fee_model.relay_fee;
-        assert_eq!(chain_a::Balances::free_balance(account_id), 500 - fees);
         assert!(chain_a::Transporter::outgoing_transfers(
             chain_b::SelfChainId::get(),
             (U256::zero(), U256::one()),
@@ -701,14 +726,6 @@ fn verify_transfer_on_chain(
                 message_id: (U256::zero(), U256::one()),
             },
         ));
-        chain_a::System::assert_has_event(chain_a::RuntimeEvent::Messenger(
-            crate::Event::<chain_a::Runtime>::OutboxMessageResponse {
-                chain_id: chain_b::SelfChainId::get(),
-                channel_id: U256::zero(),
-                nonce: U256::one(),
-            },
-        ));
-        assert_eq!(chain_a::Balances::free_balance(account_id), 496);
         assert!(chain_a::Transporter::outgoing_transfers(
             chain_b::SelfChainId::get(),
             (U256::zero(), U256::one()),
@@ -733,12 +750,11 @@ fn verify_transfer_on_chain(
             channel_id: U256::zero(),
             nonce: U256::one(),
         }));
-        assert_eq!(chain_b::Balances::free_balance(account_id), 1500);
+        assert_eq!(chain_b::Balances::free_balance(account_id), 500000500);
     })
 }
 
 #[test]
-#[ignore]
 fn test_transport_funds_between_chains() {
     let mut chain_a_test_ext = chain_a::new_test_ext();
     let mut chain_b_test_ext = chain_b::new_test_ext();
@@ -760,6 +776,9 @@ fn test_transport_funds_between_chains() {
         &mut chain_b_test_ext,
         channel_id,
         Nonce::one(),
+        false,
+        Default::default(),
+        Some(Endpoint::Id(100)),
     );
 
     // post check
@@ -767,7 +786,6 @@ fn test_transport_funds_between_chains() {
 }
 
 #[test]
-#[ignore]
 fn test_transport_funds_between_chains_failed_low_balance() {
     let mut chain_a_test_ext = chain_a::new_test_ext();
     let mut chain_b_test_ext = chain_b::new_test_ext();

@@ -11,6 +11,7 @@ use futures::channel::oneshot;
 use futures::{FutureExt, StreamExt};
 use sc_client_api::{BlockBackend, BlockchainEvents, HeaderBackend, ProofProvider};
 use sc_consensus::ImportQueue;
+use sc_domains::RuntimeExecutor;
 use sc_network::config::Roles;
 use sc_network::peer_store::PeerStore;
 use sc_network::NetworkService;
@@ -31,20 +32,6 @@ use sp_blockchain::HeaderMetadata;
 use sp_consensus::block_validation::{Chain, DefaultBlockAnnounceValidator};
 use sp_runtime::traits::{Block as BlockT, BlockIdTo, Zero};
 use std::sync::Arc;
-
-/// Host functions required for Subspace domain
-#[cfg(not(feature = "runtime-benchmarks"))]
-pub type HostFunctions = (sp_io::SubstrateHostFunctions,);
-
-/// Host functions required for Subspace domain
-#[cfg(feature = "runtime-benchmarks")]
-pub type HostFunctions = (
-    sp_io::SubstrateHostFunctions,
-    frame_benchmarking::benchmarking::HostFunctions,
-);
-
-/// Runtime executor for Subspace domain
-pub type RuntimeExecutor = sc_executor::WasmExecutor<HostFunctions>;
 
 /// Domain full client.
 pub type FullClient<Block, RuntimeApi> = TFullClient<Block, RuntimeApi, RuntimeExecutor>;
@@ -153,8 +140,6 @@ where
     let (engine, sync_service, block_announce_config) = SyncingEngine::new(
         Roles::from(&config.role),
         client.clone(),
-        // TODO: False-positive in clippy: https://github.com/rust-lang/rust-clippy/issues/12148
-        #[allow(clippy::useless_asref)]
         config
             .prometheus_config
             .as_ref()
@@ -214,8 +199,6 @@ where
         genesis_hash,
         protocol_id,
         fork_id: config.chain_spec.fork_id().map(ToOwned::to_owned),
-        // TODO: False-positive in clippy: https://github.com/rust-lang/rust-clippy/issues/12148
-        #[allow(clippy::useless_asref)]
         metrics_registry: config
             .prometheus_config
             .as_ref()
@@ -238,8 +221,6 @@ where
             transaction_pool,
             client.clone(),
         )),
-        // TODO: False-positive in clippy: https://github.com/rust-lang/rust-clippy/issues/12148
-        #[allow(clippy::useless_asref)]
         config
             .prometheus_config
             .as_ref()

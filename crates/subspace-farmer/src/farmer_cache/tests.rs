@@ -15,7 +15,7 @@ use std::time::Duration;
 use subspace_core_primitives::{
     HistorySize, LastArchivedBlock, Piece, PieceIndex, SegmentHeader, SegmentIndex,
 };
-use subspace_farmer_components::{FarmerProtocolInfo, PieceGetter, PieceGetterRetryPolicy};
+use subspace_farmer_components::{FarmerProtocolInfo, PieceGetter};
 use subspace_networking::libp2p::identity;
 use subspace_networking::libp2p::kad::RecordKey;
 use subspace_networking::utils::multihash::ToMultihash;
@@ -141,7 +141,6 @@ impl PieceGetter for MockPieceGetter {
     async fn get_piece(
         &self,
         piece_index: PieceIndex,
-        _retry_policy: PieceGetterRetryPolicy,
     ) -> Result<Option<Piece>, Box<dyn std::error::Error + Send + Sync + 'static>> {
         Ok(Some(
             self.pieces
@@ -191,15 +190,32 @@ async fn basic() {
         let farmer_cache_worker_exited =
             tokio::spawn(farmer_cache_worker.run(piece_getter.clone()));
 
-        let initialized_fut = farmer_cache
-            .replace_backing_caches(vec![
-                DiskPieceCache::open(path1.as_ref(), 1).unwrap(),
-                DiskPieceCache::open(path2.as_ref(), 1).unwrap(),
-            ])
+        let (sender, receiver) = oneshot::channel();
+        farmer_cache
+            .on_sync_progress(Arc::new({
+                let sender = Mutex::new(Some(sender));
+
+                move |progress| {
+                    if *progress == 100.0 {
+                        if let Some(sender) = sender.lock().take() {
+                            sender.send(()).unwrap();
+                        }
+                    }
+                }
+            }))
+            .detach();
+        farmer_cache
+            .replace_backing_caches(
+                vec![
+                    DiskPieceCache::open(path1.as_ref(), 1).unwrap(),
+                    DiskPieceCache::open(path2.as_ref(), 1).unwrap(),
+                ],
+                vec![],
+            )
             .await;
 
         // Wait for piece cache to be initialized
-        initialized_fut.await.unwrap();
+        receiver.await.unwrap();
 
         // These 2 pieces are requested from node during initialization
         {
@@ -373,17 +389,34 @@ async fn basic() {
 
         let farmer_cache_worker_exited = tokio::spawn(farmer_cache_worker.run(piece_getter));
 
+        let (sender, receiver) = oneshot::channel();
+        farmer_cache
+            .on_sync_progress(Arc::new({
+                let sender = Mutex::new(Some(sender));
+
+                move |progress| {
+                    if *progress == 100.0 {
+                        if let Some(sender) = sender.lock().take() {
+                            sender.send(()).unwrap();
+                        }
+                    }
+                }
+            }))
+            .detach();
         // Reopen with the same backing caches
-        let initialized_fut = farmer_cache
-            .replace_backing_caches(vec![
-                DiskPieceCache::open(path1.as_ref(), 1).unwrap(),
-                DiskPieceCache::open(path2.as_ref(), 1).unwrap(),
-            ])
+        farmer_cache
+            .replace_backing_caches(
+                vec![
+                    DiskPieceCache::open(path1.as_ref(), 1).unwrap(),
+                    DiskPieceCache::open(path2.as_ref(), 1).unwrap(),
+                ],
+                vec![],
+            )
             .await;
         drop(farmer_cache);
 
         // Wait for piece cache to be initialized
-        initialized_fut.await.unwrap();
+        receiver.await.unwrap();
 
         // Same state as before, no pieces should be requested during initialization
         assert_eq!(pieces.lock().len(), 0);

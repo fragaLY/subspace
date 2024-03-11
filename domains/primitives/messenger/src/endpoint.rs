@@ -1,12 +1,15 @@
-use crate::messages::ChainId;
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use codec::{Decode, Encode};
 use frame_support::weights::Weight;
 use frame_support::Parameter;
 use scale_info::TypeInfo;
-use sp_domains::DomainId;
+use sp_domains::ChainId;
 use sp_runtime::traits::Member;
-use sp_runtime::{sp_std, DispatchError, DispatchResult};
-use sp_std::vec::Vec;
+use sp_runtime::{DispatchError, DispatchResult};
 
 /// Represents a particular endpoint in a given Execution environment.
 pub type EndpointId = u64;
@@ -108,23 +111,5 @@ impl<MessageId> EndpointHandler<MessageId> for BenchmarkEndpointHandler {
 
     fn message_response_weight(&self) -> Weight {
         Weight::zero()
-    }
-}
-
-/// Trait that can provide info for a given Domain.
-pub trait DomainInfo<Number, Hash, StateRoot> {
-    /// Returns the best known number of a given Domain.
-    fn domain_best_number(domain_id: DomainId) -> Option<Number>;
-    /// Returns the known state root of a specific block.
-    fn domain_state_root(domain_id: DomainId, number: Number, hash: Hash) -> Option<StateRoot>;
-}
-
-impl<Number, Hash, StateRoot> DomainInfo<Number, Hash, StateRoot> for () {
-    fn domain_best_number(_domain_id: DomainId) -> Option<Number> {
-        None
-    }
-
-    fn domain_state_root(_domain_id: DomainId, _number: Number, _hash: Hash) -> Option<StateRoot> {
-        None
     }
 }

@@ -1,13 +1,18 @@
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
 #[cfg(feature = "std")]
 use crate::FraudProofExtension;
 use crate::{FraudProofVerificationInfoRequest, FraudProofVerificationInfoResponse};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+use domain_runtime_primitives::BlockNumber;
 use sp_core::H256;
 use sp_domains::DomainId;
 #[cfg(feature = "std")]
 use sp_externalities::ExternalitiesExt;
 use sp_runtime::OpaqueExtrinsic;
 use sp_runtime_interface::runtime_interface;
-use sp_std::vec::Vec;
 
 /// Domain fraud proof related runtime interface
 #[runtime_interface]
@@ -36,6 +41,8 @@ pub trait FraudProofRuntimeInterface {
     }
 
     /// Check the execution proof
+    // TODO: remove before the new network
+    #[version(1)]
     fn execution_proof_check(
         &mut self,
         pre_state_root: H256,
@@ -47,6 +54,30 @@ pub trait FraudProofRuntimeInterface {
         self.extension::<FraudProofExtension>()
             .expect("No `FraudProofExtension` associated for the current context!")
             .execution_proof_check(
+                (Default::default(), Default::default()),
+                pre_state_root,
+                encoded_proof,
+                execution_method,
+                call_data,
+                domain_runtime_code,
+            )
+    }
+
+    /// Check the execution proof with also included domain block id.
+    #[version(2)]
+    fn execution_proof_check(
+        &mut self,
+        domain_block_id: (BlockNumber, H256),
+        pre_state_root: H256,
+        encoded_proof: Vec<u8>,
+        execution_method: &str,
+        call_data: &[u8],
+        domain_runtime_code: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        self.extension::<FraudProofExtension>()
+            .expect("No `FraudProofExtension` associated for the current context!")
+            .execution_proof_check(
+                domain_block_id,
                 pre_state_root,
                 encoded_proof,
                 execution_method,

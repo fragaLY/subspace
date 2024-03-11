@@ -90,10 +90,12 @@ macro_rules! impl_runtime {
             type SelfChainId = SelfChainId;
             type Currency = Balances;
             type ConfirmationDepth = RelayerConfirmationDepth;
-            type DomainInfo = ();
             type WeightInfo = ();
             type WeightToFee = frame_support::weights::IdentityFee<u64>;
             type OnXDMRewards = ();
+            type MmrHash = H256;
+            type MmrProofVerifier = ();
+            type StorageKeys = ();
             /// function to fetch endpoint response handler by Endpoint.
             fn get_endpoint_handler(
                 #[allow(unused_variables)] endpoint: &Endpoint,
@@ -167,7 +169,7 @@ macro_rules! impl_runtime {
         }
 
         pub const USER_ACCOUNT: AccountId = 1;
-        pub const USER_INITIAL_BALANCE: Balance = 1000;
+        pub const USER_INITIAL_BALANCE: Balance = 500000000;
 
         pub fn new_test_ext() -> TestExternalities {
             let mut t = frame_system::GenesisConfig::<Runtime>::default()

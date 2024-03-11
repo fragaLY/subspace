@@ -5,6 +5,7 @@ use crate::commands::farm::dsn::configure_dsn;
 use crate::commands::farm::metrics::{FarmerMetrics, SectorState};
 use crate::utils::shutdown_signal;
 use anyhow::anyhow;
+use backoff::ExponentialBackoff;
 use bytesize::ByteSize;
 use clap::{Parser, ValueHint};
 use futures::channel::oneshot;
@@ -12,13 +13,15 @@ use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{FutureExt, StreamExt};
 use parking_lot::Mutex;
 use prometheus_client::registry::Registry;
-use std::fs;
+use rayon::prelude::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU8, NonZeroUsize};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
+use std::{fmt, fs};
 use subspace_core_primitives::crypto::kzg::{embedded_kzg_settings, Kzg};
 use subspace_core_primitives::{PublicKey, Record, SectorIndex};
 use subspace_erasure_coding::ErasureCoding;
@@ -28,7 +31,7 @@ use subspace_farmer::single_disk_farm::{
     SectorExpirationDetails, SectorPlottingDetails, SectorUpdate, SingleDiskFarm,
     SingleDiskFarmError, SingleDiskFarmOptions,
 };
-use subspace_farmer::utils::farmer_piece_getter::FarmerPieceGetter;
+use subspace_farmer::utils::farmer_piece_getter::{DsnCacheRetryPolicy, FarmerPieceGetter};
 use subspace_farmer::utils::piece_validator::SegmentCommitmentPieceValidator;
 use subspace_farmer::utils::plotted_pieces::PlottedPieces;
 use subspace_farmer::utils::ss58::parse_ss58_reward_address;
@@ -45,9 +48,18 @@ use subspace_networking::libp2p::multiaddr::Protocol;
 use subspace_networking::libp2p::Multiaddr;
 use subspace_networking::utils::piece_provider::PieceProvider;
 use subspace_proof_of_space::Table;
+use thread_priority::ThreadPriority;
+use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, info_span, warn};
 use zeroize::Zeroizing;
+
+/// Get piece retry attempts number.
+const PIECE_GETTER_MAX_RETRIES: u16 = 7;
+/// Defines initial duration between get_piece calls.
+const GET_PIECE_INITIAL_INTERVAL: Duration = Duration::from_secs(5);
+/// Defines max duration between get_piece calls.
+const GET_PIECE_MAX_INTERVAL: Duration = Duration::from_secs(40);
 
 fn should_farm_during_initial_plotting() -> bool {
     let total_cpu_cores = all_cpu_cores()
@@ -55,6 +67,50 @@ fn should_farm_during_initial_plotting() -> bool {
         .flat_map(|set| set.cpu_cores())
         .count();
     total_cpu_cores > 8
+}
+
+/// Plotting thread priority
+#[derive(Debug, Parser, Copy, Clone)]
+enum PlottingThreadPriority {
+    /// Minimum priority
+    Min,
+    /// Default priority
+    Default,
+    /// Max priority (not recommended)
+    Max,
+}
+
+impl FromStr for PlottingThreadPriority {
+    type Err = String;
+
+    fn from_str(s: &str) -> anyhow::Result<Self, Self::Err> {
+        match s {
+            "min" => Ok(Self::Min),
+            "default" => Ok(Self::Default),
+            "max" => Ok(Self::Max),
+            s => Err(format!("Thread priority {s} is not valid")),
+        }
+    }
+}
+
+impl fmt::Display for PlottingThreadPriority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Min => "min",
+            Self::Default => "default",
+            Self::Max => "max",
+        })
+    }
+}
+
+impl From<PlottingThreadPriority> for Option<ThreadPriority> {
+    fn from(value: PlottingThreadPriority) -> Self {
+        match value {
+            PlottingThreadPriority::Min => Some(ThreadPriority::Min),
+            PlottingThreadPriority::Default => None,
+            PlottingThreadPriority::Max => Some(ThreadPriority::Max),
+        }
+    }
 }
 
 /// Arguments for farmer
@@ -162,7 +218,7 @@ pub(crate) struct FarmingArgs {
     /// Cores are coma-separated, with whitespace separating different thread pools/encoding
     /// instances. For example "0,1 2,3" will result in two sectors being encoded at the same time,
     /// each with a pair of CPU cores.
-    #[arg(long, conflicts_with_all = &["sector_encoding_concurrency", "plotting_thread_pool_size"])]
+    #[arg(long, conflicts_with_all = & ["sector_encoding_concurrency", "plotting_thread_pool_size"])]
     plotting_cpu_cores: Option<String>,
     /// Size of one thread pool used for replotting, typically smaller pool than for plotting
     /// to not affect farming as much, defaults to half of the number of logical CPUs available on
@@ -182,8 +238,12 @@ pub(crate) struct FarmingArgs {
     /// Cores are coma-separated, with whitespace separating different thread pools/encoding
     /// instances. For example "0,1 2,3" will result in two sectors being encoded at the same time,
     /// each with a pair of CPU cores.
-    #[arg(long, conflicts_with_all = &["sector_encoding_concurrency", "replotting_thread_pool_size"])]
+    #[arg(long, conflicts_with_all = & ["sector_encoding_concurrency", "replotting_thread_pool_size"])]
     replotting_cpu_cores: Option<String>,
+    /// Plotting thread priority, by default de-prioritizes plotting threads in order to make sure
+    /// farming is successful and computer can be used comfortably for other things
+    #[arg(long, default_value_t = PlottingThreadPriority::Min)]
+    plotting_thread_priority: PlottingThreadPriority,
     /// Disable farm locking, for example if file system doesn't support it
     #[arg(long)]
     disable_farm_locking: bool,
@@ -208,16 +268,16 @@ struct DsnArgs {
     /// Multiaddr to listen on for subspace networking, for instance `/ip4/0.0.0.0/tcp/0`,
     /// multiple are supported.
     #[arg(long, default_values_t = [
-        Multiaddr::from(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-            .with(Protocol::Udp(30533))
-            .with(Protocol::QuicV1),
-        Multiaddr::from(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
-            .with(Protocol::Udp(30533))
-            .with(Protocol::QuicV1),
-        Multiaddr::from(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-            .with(Protocol::Tcp(30533)),
-        Multiaddr::from(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
-            .with(Protocol::Tcp(30533))
+    Multiaddr::from(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+    .with(Protocol::Udp(30533))
+    .with(Protocol::QuicV1),
+    Multiaddr::from(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+    .with(Protocol::Udp(30533))
+    .with(Protocol::QuicV1),
+    Multiaddr::from(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+    .with(Protocol::Tcp(30533)),
+    Multiaddr::from(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+    .with(Protocol::Tcp(30533))
     ])]
     listen_on: Vec<Multiaddr>,
     /// Determines whether we allow keeping non-global (private, shared, loopback..) addresses in
@@ -337,6 +397,7 @@ where
         plotting_cpu_cores,
         replotting_thread_pool_size,
         replotting_cpu_cores,
+        plotting_thread_priority,
         disable_farm_locking,
     } = farming_args;
 
@@ -448,6 +509,17 @@ where
         farmer_cache.clone(),
         node_client.clone(),
         Arc::clone(&plotted_pieces),
+        DsnCacheRetryPolicy {
+            max_retries: PIECE_GETTER_MAX_RETRIES,
+            backoff: ExponentialBackoff {
+                initial_interval: GET_PIECE_INITIAL_INTERVAL,
+                max_interval: GET_PIECE_MAX_INTERVAL,
+                // Try until we get a valid piece
+                max_elapsed_time: None,
+                multiplier: 1.75,
+                ..ExponentialBackoff::default()
+            },
+        },
     );
 
     let farmer_cache_worker_fut = run_future_in_dedicated_thread(
@@ -459,7 +531,6 @@ where
         "farmer-cache-worker".to_string(),
     )?;
 
-    let mut single_disk_farms = Vec::with_capacity(disk_farms.len());
     let max_pieces_in_sector = match max_pieces_in_sector {
         Some(max_pieces_in_sector) => {
             if max_pieces_in_sector > farmer_app_info.protocol_info.max_pieces_in_sector {
@@ -544,107 +615,136 @@ where
             .first()
             .expect("Guaranteed to have some CPU cores; qed");
 
-        NonZeroUsize::new((cpu_cores.cpu_cores().len() / 2).min(8))
-            .expect("Guaranteed to have some CPU cores; qed")
+        NonZeroUsize::new((cpu_cores.cpu_cores().len() / 2).max(1).min(8)).expect("Not zero; qed")
     });
 
     let plotting_thread_pool_manager = create_plotting_thread_pool_manager(
         plotting_thread_pool_core_indices
             .into_iter()
             .zip(replotting_thread_pool_core_indices),
+        plotting_thread_priority.into(),
     )?;
     let farming_thread_pool_size = farming_thread_pool_size
         .map(|farming_thread_pool_size| farming_thread_pool_size.get())
         .unwrap_or_else(recommended_number_of_farming_threads);
 
-    let mut plotting_delay_senders = Vec::with_capacity(disk_farms.len());
+    let (single_disk_farms, plotting_delay_senders) = tokio::task::block_in_place(|| {
+        let handle = Handle::current();
+        let (plotting_delay_senders, plotting_delay_receivers) = (0..disk_farms.len())
+            .map(|_| oneshot::channel())
+            .unzip::<_, _, Vec<_>, Vec<_>>();
 
-    for (disk_farm_index, disk_farm) in disk_farms.into_iter().enumerate() {
-        debug!(url = %node_rpc_url, %disk_farm_index, "Connecting to node RPC");
-        let node_client = NodeRpcClient::new(&node_rpc_url).await?;
-        let (plotting_delay_sender, plotting_delay_receiver) = oneshot::channel();
-        plotting_delay_senders.push(plotting_delay_sender);
+        let single_disk_farms = disk_farms
+            .into_par_iter()
+            .zip(plotting_delay_receivers)
+            .enumerate()
+            .map(
+                move |(disk_farm_index, (disk_farm, plotting_delay_receiver))| {
+                    let _tokio_handle_guard = handle.enter();
 
-        let single_disk_farm_fut = SingleDiskFarm::new::<_, _, PosTable>(
-            SingleDiskFarmOptions {
-                directory: disk_farm.directory.clone(),
-                farmer_app_info: farmer_app_info.clone(),
-                allocated_space: disk_farm.allocated_plotting_space,
-                max_pieces_in_sector,
-                node_client,
-                reward_address,
-                kzg: kzg.clone(),
-                erasure_coding: erasure_coding.clone(),
-                piece_getter: piece_getter.clone(),
-                cache_percentage,
-                downloading_semaphore: Arc::clone(&downloading_semaphore),
-                record_encoding_concurrency,
-                farm_during_initial_plotting,
-                farming_thread_pool_size,
-                plotting_thread_pool_manager: plotting_thread_pool_manager.clone(),
-                plotting_delay: Some(plotting_delay_receiver),
-                disable_farm_locking,
-            },
-            disk_farm_index,
-        );
+                    debug!(url = %node_rpc_url, %disk_farm_index, "Connecting to node RPC");
+                    let node_client = handle.block_on(NodeRpcClient::new(&node_rpc_url))?;
 
-        let single_disk_farm = match single_disk_farm_fut.await {
-            Ok(single_disk_farm) => single_disk_farm,
-            Err(SingleDiskFarmError::InsufficientAllocatedSpace {
-                min_space,
-                allocated_space,
-            }) => {
-                return Err(anyhow::anyhow!(
-                    "Allocated space {} ({}) is not enough, minimum is ~{} (~{}, {} bytes to be \
-                    exact)",
-                    bytesize::to_string(allocated_space, true),
-                    bytesize::to_string(allocated_space, false),
-                    bytesize::to_string(min_space, true),
-                    bytesize::to_string(min_space, false),
-                    min_space
-                ));
-            }
-            Err(error) => {
-                return Err(error.into());
-            }
-        };
+                    let single_disk_farm_fut = SingleDiskFarm::new::<_, _, PosTable>(
+                        SingleDiskFarmOptions {
+                            directory: disk_farm.directory.clone(),
+                            farmer_app_info: farmer_app_info.clone(),
+                            allocated_space: disk_farm.allocated_plotting_space,
+                            max_pieces_in_sector,
+                            node_client,
+                            reward_address,
+                            kzg: kzg.clone(),
+                            erasure_coding: erasure_coding.clone(),
+                            piece_getter: piece_getter.clone(),
+                            cache_percentage,
+                            downloading_semaphore: Arc::clone(&downloading_semaphore),
+                            record_encoding_concurrency,
+                            farm_during_initial_plotting,
+                            farming_thread_pool_size,
+                            plotting_thread_pool_manager: plotting_thread_pool_manager.clone(),
+                            plotting_delay: Some(plotting_delay_receiver),
+                            disable_farm_locking,
+                        },
+                        disk_farm_index,
+                    );
 
-        if !no_info {
-            let info = single_disk_farm.info();
-            println!("Single disk farm {disk_farm_index}:");
-            println!("  ID: {}", info.id());
-            println!("  Genesis hash: 0x{}", hex::encode(info.genesis_hash()));
-            println!("  Public key: 0x{}", hex::encode(info.public_key()));
-            println!(
-                "  Allocated space: {} ({})",
-                bytesize::to_string(info.allocated_space(), true),
-                bytesize::to_string(info.allocated_space(), false)
-            );
-            println!("  Directory: {}", disk_farm.directory.display());
-        }
+                    let single_disk_farm = match handle.block_on(single_disk_farm_fut) {
+                        Ok(single_disk_farm) => single_disk_farm,
+                        Err(SingleDiskFarmError::InsufficientAllocatedSpace {
+                            min_space,
+                            allocated_space,
+                        }) => {
+                            return Err(anyhow::anyhow!(
+                                "Allocated space {} ({}) is not enough, minimum is ~{} (~{}, \
+                                {} bytes to be exact)",
+                                bytesize::to_string(allocated_space, true),
+                                bytesize::to_string(allocated_space, false),
+                                bytesize::to_string(min_space, true),
+                                bytesize::to_string(min_space, false),
+                                min_space
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(error.into());
+                        }
+                    };
 
-        single_disk_farms.push(single_disk_farm);
+                    if !no_info {
+                        let info = single_disk_farm.info();
+                        println!("Single disk farm {disk_farm_index}:");
+                        println!("  ID: {}", info.id());
+                        println!("  Genesis hash: 0x{}", hex::encode(info.genesis_hash()));
+                        println!("  Public key: 0x{}", hex::encode(info.public_key()));
+                        println!(
+                            "  Allocated space: {} ({})",
+                            bytesize::to_string(info.allocated_space(), true),
+                            bytesize::to_string(info.allocated_space(), false)
+                        );
+                        println!("  Directory: {}", disk_farm.directory.display());
+                    }
+
+                    Ok(single_disk_farm)
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+
+        anyhow::Ok((single_disk_farms, plotting_delay_senders))
+    })?;
+
+    {
+        let handler_id = Arc::new(Mutex::new(None));
+        // Wait for piece cache to read already cached contents before starting plotting to improve
+        // cache hit ratio
+        handler_id
+            .lock()
+            .replace(farmer_cache.on_sync_progress(Arc::new({
+                let handler_id = Arc::clone(&handler_id);
+                let plotting_delay_senders = Mutex::new(plotting_delay_senders);
+
+                move |_progress| {
+                    for plotting_delay_sender in plotting_delay_senders.lock().drain(..) {
+                        // Doesn't matter if receiver is gone
+                        let _ = plotting_delay_sender.send(());
+                    }
+
+                    // Unsubscribe from this event
+                    handler_id.lock().take();
+                }
+            })));
     }
-
-    let cache_acknowledgement_receiver = farmer_cache
+    farmer_cache
         .replace_backing_caches(
             single_disk_farms
                 .iter()
                 .map(|single_disk_farm| single_disk_farm.piece_cache())
                 .collect(),
+            single_disk_farms
+                .iter()
+                .map(|single_disk_farm| single_disk_farm.plot_cache())
+                .collect(),
         )
         .await;
     drop(farmer_cache);
-
-    // Wait for cache initialization before starting plotting
-    tokio::spawn(async move {
-        if cache_acknowledgement_receiver.await.is_ok() {
-            for plotting_delay_sender in plotting_delay_senders {
-                // Doesn't matter if receiver is gone
-                let _ = plotting_delay_sender.send(());
-            }
-        }
-    });
 
     // Store piece readers so we can reference them later
     let piece_readers = single_disk_farms

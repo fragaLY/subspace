@@ -8,8 +8,11 @@ mod precompiles;
 #[cfg(feature = "std")]
 include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 
+#[cfg(not(feature = "std"))]
 extern crate alloc;
 
+#[cfg(not(feature = "std"))]
+use alloc::format;
 use codec::{Decode, Encode};
 use domain_runtime_primitives::opaque::Header;
 pub use domain_runtime_primitives::{
@@ -46,13 +49,14 @@ use sp_core::{Get, OpaqueMetadata, H160, H256, U256};
 use sp_domains::{DomainId, Transfers};
 use sp_messenger::endpoint::{Endpoint, EndpointHandler as EndpointHandlerT, EndpointId};
 use sp_messenger::messages::{
-    BlockInfo, BlockMessagesWithStorageKey, ChainId, CrossDomainMessage,
-    ExtractedStateRootsFromProof, MessageId,
+    BlockMessagesWithStorageKey, ChainId, CrossDomainMessage, MessageId, MessageKey,
 };
+use sp_messenger_host_functions::{get_storage_key, StorageKeyRequest};
+use sp_mmr_primitives::{EncodableOpaqueLeaf, Proof};
 use sp_runtime::generic::Era;
 use sp_runtime::traits::{
     BlakeTwo256, Block as BlockT, Checkable, DispatchInfoOf, Dispatchable, IdentifyAccount,
-    IdentityLookup, One, PostDispatchInfoOf, SignedExtension, UniqueSaturatedInto,
+    IdentityLookup, Keccak256, One, PostDispatchInfoOf, SignedExtension, UniqueSaturatedInto,
     ValidateUnsigned, Verify, Zero,
 };
 use sp_runtime::transaction_validity::{
@@ -64,8 +68,12 @@ use sp_runtime::{
 pub use sp_runtime::{MultiAddress, Perbill, Permill};
 use sp_std::marker::PhantomData;
 use sp_std::prelude::*;
+use sp_subspace_mmr::domain_mmr_runtime_interface::verify_mmr_proof;
+use sp_subspace_mmr::MmrLeaf;
 use sp_version::RuntimeVersion;
-use subspace_runtime_primitives::{Moment, SlowAdjustingFeeUpdate};
+use subspace_runtime_primitives::{
+    BlockNumber as ConsensusBlockNumber, Hash as ConsensusBlockHash, Moment, SlowAdjustingFeeUpdate,
+};
 
 /// Alias to 512-bit hash when used in the context of a transaction signature on the chain.
 pub type Signature = EthereumSignature;
@@ -406,6 +414,45 @@ impl sp_messenger::OnXDMRewards<Balance> for OnXDMRewards {
     }
 }
 
+type MmrHash = <Keccak256 as sp_runtime::traits::Hash>::Output;
+
+pub struct MmrProofVerifier;
+
+impl sp_messenger::MmrProofVerifier<MmrHash, Hash> for MmrProofVerifier {
+    fn verify_proof_and_extract_consensus_state_root(
+        opaque_leaf: EncodableOpaqueLeaf,
+        proof: Proof<MmrHash>,
+    ) -> Option<Hash> {
+        let leaf: MmrLeaf<ConsensusBlockNumber, ConsensusBlockHash> =
+            opaque_leaf.into_opaque_leaf().try_decode()?;
+        let state_root = leaf.state_root();
+        verify_mmr_proof(vec![EncodableOpaqueLeaf::from_leaf(&leaf)], proof.encode())
+            .then_some(state_root)
+    }
+}
+
+pub struct StorageKeys;
+
+impl sp_messenger::StorageKeys for StorageKeys {
+    fn confirmed_domain_block_storage_key(domain_id: DomainId) -> Option<Vec<u8>> {
+        get_storage_key(StorageKeyRequest::ConfirmedDomainBlockStorageKey(domain_id))
+    }
+
+    fn outbox_storage_key(chain_id: ChainId, message_key: MessageKey) -> Option<Vec<u8>> {
+        get_storage_key(StorageKeyRequest::OutboxStorageKey {
+            chain_id,
+            message_key,
+        })
+    }
+
+    fn inbox_responses_storage_key(chain_id: ChainId, message_key: MessageKey) -> Option<Vec<u8>> {
+        get_storage_key(StorageKeyRequest::InboxResponseStorageKey {
+            chain_id,
+            message_key,
+        })
+    }
+}
+
 impl pallet_messenger::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
     type SelfChainId = SelfChainId;
@@ -419,11 +466,13 @@ impl pallet_messenger::Config for Runtime {
     }
 
     type Currency = Balances;
-    type DomainInfo = ();
     type ConfirmationDepth = RelayConfirmationDepth;
     type WeightInfo = pallet_messenger::weights::SubstrateWeight<Runtime>;
     type WeightToFee = IdentityFee<Balance>;
     type OnXDMRewards = OnXDMRewards;
+    type MmrHash = MmrHash;
+    type MmrProofVerifier = MmrProofVerifier;
+    type StorageKeys = StorageKeys;
 }
 
 impl<C> frame_system::offchain::SendTransactionTypes<C> for Runtime
@@ -654,16 +703,14 @@ impl fp_rpc::ConvertTransaction<opaque::UncheckedExtrinsic> for TransactionConve
     }
 }
 
-fn extract_xdm_proof_state_roots(
-    encoded_ext: Vec<u8>,
-) -> Option<ExtractedStateRootsFromProof<BlockNumber, Hash, Hash>> {
+fn is_xdm_valid(encoded_ext: Vec<u8>) -> Option<bool> {
     if let Ok(ext) = UncheckedExtrinsic::decode(&mut encoded_ext.as_slice()) {
         match &ext.0.function {
             RuntimeCall::Messenger(pallet_messenger::Call::relay_message { msg }) => {
-                msg.extract_state_roots_from_proof::<BlakeTwo256>()
+                Some(Messenger::validate_relay_message(msg).is_ok())
             }
             RuntimeCall::Messenger(pallet_messenger::Call::relay_message_response { msg }) => {
-                msg.extract_state_roots_from_proof::<BlakeTwo256>()
+                Some(Messenger::validate_relay_message_response(msg).is_ok())
             }
             _ => None,
         }
@@ -761,6 +808,12 @@ fn check_transaction_and_do_pre_dispatch_inner(
             .map(|_| ()),
     }
 }
+
+#[cfg(feature = "runtime-benchmarks")]
+impl frame_system_benchmarking::Config for Runtime {}
+
+#[cfg(feature = "runtime-benchmarks")]
+impl frame_benchmarking::baseline::Config for Runtime {}
 
 impl_runtime_apis! {
     impl sp_api::Core<Block> for Runtime {
@@ -957,7 +1010,7 @@ impl_runtime_apis! {
         ) -> Result<<Block as BlockT>::Extrinsic, DecodeExtrinsicError> {
             let encoded = opaque_extrinsic.encode();
             UncheckedExtrinsic::decode(&mut encoded.as_slice())
-                .map_err(|err| DecodeExtrinsicError(alloc::format!("{}", err)))
+                .map_err(|err| DecodeExtrinsicError(format!("{}", err)))
         }
 
         fn extrinsic_era(
@@ -998,40 +1051,36 @@ impl_runtime_apis! {
     }
 
     impl sp_messenger::MessengerApi<Block, BlockNumber> for Runtime {
-        fn extract_xdm_proof_state_roots(
+        fn is_xdm_valid(
             extrinsic: Vec<u8>,
-        ) -> Option<ExtractedStateRootsFromProof<BlockNumber, <Block as BlockT>::Hash, <Block as BlockT>::Hash>> {
-            extract_xdm_proof_state_roots(extrinsic)
+        ) -> Option<bool> {
+            is_xdm_valid(extrinsic)
         }
 
-        fn is_domain_info_confirmed(
-            _domain_id: DomainId,
-            _domain_block_info: BlockInfo<BlockNumber, <Block as BlockT>::Hash>,
-            _domain_state_root: <Block as BlockT>::Hash,
-        ) -> bool{
-            // not valid on evm domain
-            false
+        fn confirmed_domain_block_storage_key(_domain_id: DomainId) -> Vec<u8> {
+            // invalid call from Domain runtime
+            vec![]
+        }
+
+        fn outbox_storage_key(message_key: MessageKey) -> Vec<u8> {
+            Messenger::outbox_storage_key(message_key)
+        }
+
+        fn inbox_response_storage_key(message_key: MessageKey) -> Vec<u8> {
+            Messenger::inbox_response_storage_key(message_key)
         }
     }
 
-    impl sp_messenger::RelayerApi<Block, BlockNumber> for Runtime {
-        fn chain_id() -> ChainId {
-            SelfChainId::get()
-        }
-
-        fn relay_confirmation_depth() -> BlockNumber {
-            RelayConfirmationDepth::get()
-        }
-
+    impl sp_messenger::RelayerApi<Block, BlockNumber, ConsensusBlockHash> for Runtime {
         fn block_messages() -> BlockMessagesWithStorageKey {
             Messenger::get_block_messages()
         }
 
-        fn outbox_message_unsigned(msg: CrossDomainMessage<BlockNumber, <Block as BlockT>::Hash, <Block as BlockT>::Hash>) -> Option<<Block as BlockT>::Extrinsic> {
+        fn outbox_message_unsigned(msg: CrossDomainMessage<<Block as BlockT>::Hash, <Block as BlockT>::Hash>) -> Option<<Block as BlockT>::Extrinsic> {
             Messenger::outbox_message_unsigned(msg)
         }
 
-        fn inbox_response_message_unsigned(msg: CrossDomainMessage<BlockNumber, <Block as BlockT>::Hash, <Block as BlockT>::Hash>) -> Option<<Block as BlockT>::Extrinsic> {
+        fn inbox_response_message_unsigned(msg: CrossDomainMessage<<Block as BlockT>::Hash, <Block as BlockT>::Hash>) -> Option<<Block as BlockT>::Extrinsic> {
             Messenger::inbox_response_message_unsigned(msg)
         }
 
@@ -1248,9 +1297,6 @@ impl_runtime_apis! {
             use frame_system_benchmarking::Pallet as SystemBench;
             use frame_support::traits::WhitelistedStorageKeys;
             use baseline::Pallet as BaselineBench;
-
-            impl frame_system_benchmarking::Config for Runtime {}
-            impl baseline::Config for Runtime {}
 
             let whitelist: Vec<TrackedStorageKey> = AllPalletsWithSystem::whitelisted_storage_keys();
 

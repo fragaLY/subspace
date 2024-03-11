@@ -35,7 +35,7 @@ use frame_support::traits::{
     ConstU128, ConstU16, ConstU32, ConstU64, ConstU8, Currency, ExistenceRequirement, Get,
     Imbalance, VariantCount, WithdrawReasons,
 };
-use frame_support::weights::constants::{RocksDbWeight, WEIGHT_REF_TIME_PER_SECOND};
+use frame_support::weights::constants::{ParityDbWeight, WEIGHT_REF_TIME_PER_SECOND};
 use frame_support::weights::{ConstantMultiplier, IdentityFee, Weight};
 use frame_support::{construct_runtime, parameter_types, PalletId};
 use frame_system::limits::{BlockLength, BlockWeights};
@@ -60,9 +60,10 @@ use sp_domains::{
 use sp_domains_fraud_proof::fraud_proof::FraudProof;
 use sp_messenger::endpoint::{Endpoint, EndpointHandler as EndpointHandlerT, EndpointId};
 use sp_messenger::messages::{
-    BlockInfo, BlockMessagesWithStorageKey, ChainId, CrossDomainMessage,
-    ExtractedStateRootsFromProof, MessageId,
+    BlockMessagesWithStorageKey, ChainId, ChannelId, CrossDomainMessage, MessageId, MessageKey,
 };
+use sp_messenger_host_functions::{get_storage_key, StorageKeyRequest};
+use sp_mmr_primitives::{EncodableOpaqueLeaf, Proof};
 use sp_runtime::traits::{
     AccountIdConversion, AccountIdLookup, BlakeTwo256, Block as BlockT, ConstBool, DispatchInfoOf,
     Keccak256, NumberFor, PostDispatchInfoOf, Zero,
@@ -234,7 +235,7 @@ impl frame_system::Config for Runtime {
     /// Maximum number of block number to block hash mappings to keep (oldest pruned first).
     type BlockHashCount = ConstU32<250>;
     /// The weight of database operations that the runtime can invoke.
-    type DbWeight = RocksDbWeight;
+    type DbWeight = ParityDbWeight;
     /// Version of the runtime.
     type Version = Version;
     /// Converts a module to the index of the module in `construct_runtime!`.
@@ -525,15 +526,39 @@ parameter_types! {
     pub SelfChainId: ChainId = ChainId::Consensus;
 }
 
-pub struct DomainInfo;
+pub struct MmrProofVerifier;
 
-impl sp_messenger::endpoint::DomainInfo<BlockNumber, Hash, Hash> for DomainInfo {
-    fn domain_best_number(domain_id: DomainId) -> Option<BlockNumber> {
-        Domains::domain_best_number(domain_id)
+impl sp_messenger::MmrProofVerifier<mmr::Hash, Hash> for MmrProofVerifier {
+    fn verify_proof_and_extract_consensus_state_root(
+        opaque_leaf: EncodableOpaqueLeaf,
+        proof: Proof<mmr::Hash>,
+    ) -> Option<Hash> {
+        let leaf: mmr::Leaf = opaque_leaf.into_opaque_leaf().try_decode()?;
+        let state_root = leaf.state_root();
+        Mmr::verify_leaves(vec![leaf], proof).ok()?;
+        Some(state_root)
+    }
+}
+
+pub struct StorageKeys;
+
+impl sp_messenger::StorageKeys for StorageKeys {
+    fn confirmed_domain_block_storage_key(domain_id: DomainId) -> Option<Vec<u8>> {
+        Some(Domains::confirmed_domain_block_storage_key(domain_id))
     }
 
-    fn domain_state_root(_domain_id: DomainId, _number: BlockNumber, _hash: Hash) -> Option<Hash> {
-        None
+    fn outbox_storage_key(chain_id: ChainId, message_key: MessageKey) -> Option<Vec<u8>> {
+        get_storage_key(StorageKeyRequest::OutboxStorageKey {
+            chain_id,
+            message_key,
+        })
+    }
+
+    fn inbox_responses_storage_key(chain_id: ChainId, message_key: MessageKey) -> Option<Vec<u8>> {
+        get_storage_key(StorageKeyRequest::InboxResponseStorageKey {
+            chain_id,
+            message_key,
+        })
     }
 }
 
@@ -550,11 +575,13 @@ impl pallet_messenger::Config for Runtime {
     }
 
     type Currency = Balances;
-    type DomainInfo = DomainInfo;
     type ConfirmationDepth = RelayConfirmationDepth;
     type WeightInfo = pallet_messenger::weights::SubstrateWeight<Runtime>;
     type WeightToFee = IdentityFee<domain_runtime_primitives::Balance>;
     type OnXDMRewards = ();
+    type MmrHash = mmr::Hash;
+    type MmrProofVerifier = MmrProofVerifier;
+    type StorageKeys = StorageKeys;
 }
 
 impl<C> frame_system::offchain::SendTransactionTypes<C> for Runtime
@@ -783,22 +810,14 @@ fn extract_segment_headers(ext: &UncheckedExtrinsic) -> Option<Vec<SegmentHeader
     }
 }
 
-fn extract_xdm_proof_state_roots(
-    encoded_ext: Vec<u8>,
-) -> Option<
-    ExtractedStateRootsFromProof<
-        domain_runtime_primitives::BlockNumber,
-        domain_runtime_primitives::Hash,
-        domain_runtime_primitives::Hash,
-    >,
-> {
+fn is_xdm_valid(encoded_ext: Vec<u8>) -> Option<bool> {
     if let Ok(ext) = UncheckedExtrinsic::decode(&mut encoded_ext.as_slice()) {
         match &ext.function {
             RuntimeCall::Messenger(pallet_messenger::Call::relay_message { msg }) => {
-                msg.extract_state_roots_from_proof::<BlakeTwo256>()
+                Some(Messenger::validate_relay_message(msg).is_ok())
             }
             RuntimeCall::Messenger(pallet_messenger::Call::relay_message_response { msg }) => {
-                msg.extract_state_roots_from_proof::<BlakeTwo256>()
+                Some(Messenger::validate_relay_message_response(msg).is_ok())
             }
             _ => None,
         }
@@ -1254,10 +1273,6 @@ impl_runtime_apis! {
             Domains::domain_best_number(domain_id)
         }
 
-        fn domain_state_root(_domain_id: DomainId, _number: DomainNumber, _hash: DomainHash) -> Option<DomainHash>{
-            None
-        }
-
         fn execution_receipt(receipt_hash: DomainHash) -> Option<ExecutionReceiptFor<DomainHeader, Block, Balance>> {
             Domains::execution_receipt(receipt_hash)
         }
@@ -1283,6 +1298,17 @@ impl_runtime_apis! {
 
         fn consensus_chain_byte_fee() -> Balance {
             DOMAIN_STORAGE_FEE_MULTIPLIER * TransactionFees::transaction_byte_fee()
+        }
+
+        fn latest_confirmed_domain_block(domain_id: DomainId) -> Option<(DomainNumber, DomainHash)>{
+            Domains::latest_confirmed_domain_block(domain_id)
+        }
+
+        fn is_bad_er_pending_to_prune(domain_id: DomainId, receipt_hash: DomainHash) -> bool {
+            Domains::execution_receipt(receipt_hash).map(
+                |er| Domains::is_bad_er_pending_to_prune(domain_id, er.domain_block_number)
+            )
+            .unwrap_or(false)
         }
     }
 
@@ -1336,39 +1362,35 @@ impl_runtime_apis! {
     }
 
     impl sp_messenger::MessengerApi<Block, BlockNumber> for Runtime {
-        fn extract_xdm_proof_state_roots(
+        fn is_xdm_valid(
             extrinsic: Vec<u8>,
-        ) -> Option<ExtractedStateRootsFromProof<BlockNumber, <Block as BlockT>::Hash, <Block as BlockT>::Hash>> {
-            extract_xdm_proof_state_roots(extrinsic)
+        ) -> Option<bool> {
+            is_xdm_valid(extrinsic)
         }
 
-        fn is_domain_info_confirmed(
-            domain_id: DomainId,
-            domain_block_info: BlockInfo<BlockNumber, <Block as BlockT>::Hash>,
-            domain_state_root: <Block as BlockT>::Hash,
-        ) -> bool{
-            Messenger::is_domain_info_confirmed(domain_id, domain_block_info, domain_state_root)
+        fn confirmed_domain_block_storage_key(domain_id: DomainId) -> Vec<u8> {
+            Domains::confirmed_domain_block_storage_key(domain_id)
+        }
+
+        fn outbox_storage_key(message_key: MessageKey) -> Vec<u8> {
+            Messenger::outbox_storage_key(message_key)
+        }
+
+        fn inbox_response_storage_key(message_key: MessageKey) -> Vec<u8> {
+            Messenger::inbox_response_storage_key(message_key)
         }
     }
 
-    impl sp_messenger::RelayerApi<Block, BlockNumber> for Runtime {
-        fn chain_id() -> ChainId {
-            SelfChainId::get()
-        }
-
-        fn relay_confirmation_depth() -> BlockNumber {
-            RelayConfirmationDepth::get()
-        }
-
+    impl sp_messenger::RelayerApi<Block, BlockNumber, <Block as BlockT>::Hash> for Runtime {
         fn block_messages() -> BlockMessagesWithStorageKey {
             Messenger::get_block_messages()
         }
 
-        fn outbox_message_unsigned(msg: CrossDomainMessage<BlockNumber, <Block as BlockT>::Hash, <Block as BlockT>::Hash>) -> Option<<Block as BlockT>::Extrinsic> {
+        fn outbox_message_unsigned(msg: CrossDomainMessage<<Block as BlockT>::Hash, <Block as BlockT>::Hash>) -> Option<<Block as BlockT>::Extrinsic> {
             Messenger::outbox_message_unsigned(msg)
         }
 
-        fn inbox_response_message_unsigned(msg: CrossDomainMessage<BlockNumber, <Block as BlockT>::Hash, <Block as BlockT>::Hash>) -> Option<<Block as BlockT>::Extrinsic> {
+        fn inbox_response_message_unsigned(msg: CrossDomainMessage<<Block as BlockT>::Hash, <Block as BlockT>::Hash>) -> Option<<Block as BlockT>::Extrinsic> {
             Messenger::inbox_response_message_unsigned(msg)
         }
 
@@ -1437,6 +1459,16 @@ impl_runtime_apis! {
         ) -> Result<(), mmr::Error> {
             let nodes = leaves.into_iter().map(|leaf|mmr::DataOrHash::Data(leaf.into_opaque_leaf())).collect();
             pallet_mmr::verify_leaves_proof::<mmr::Hashing, _>(root, nodes, proof)
+        }
+    }
+
+    impl subspace_test_primitives::OnchainStateApi<Block, AccountId, Balance> for Runtime {
+        fn free_balance(account_id: AccountId) -> Balance {
+            Balances::free_balance(account_id)
+        }
+
+        fn get_open_channel_for_chain(dst_chain_id: ChainId) -> Option<ChannelId> {
+            Messenger::get_open_channel_for_chain(dst_chain_id).map(|(c, _)| c)
         }
     }
 }

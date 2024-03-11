@@ -1,7 +1,9 @@
 pub mod farming;
 pub mod piece_cache;
 pub mod piece_reader;
+pub mod plot_cache;
 mod plotting;
+pub mod unbuffered_io_file_windows;
 
 use crate::identity::{Identity, IdentityError};
 use crate::node_client::NodeClient;
@@ -13,12 +15,16 @@ use crate::single_disk_farm::farming::{
 };
 use crate::single_disk_farm::piece_cache::{DiskPieceCache, DiskPieceCacheError};
 use crate::single_disk_farm::piece_reader::PieceReader;
+use crate::single_disk_farm::plot_cache::DiskPlotCache;
 use crate::single_disk_farm::plotting::{
     plotting, plotting_scheduler, PlottingOptions, PlottingSchedulerOptions,
 };
 pub use crate::single_disk_farm::plotting::{
     PlottingError, SectorExpirationDetails, SectorPlottingDetails,
 };
+#[cfg(windows)]
+use crate::single_disk_farm::unbuffered_io_file_windows::UnbufferedIoFileWindows;
+use crate::single_disk_farm::unbuffered_io_file_windows::DISK_SECTOR_SIZE;
 use crate::thread_pool_manager::PlottingThreadPoolManager;
 use crate::utils::{tokio_rayon_spawn_handler, AsyncJoinOnDrop};
 use crate::KNOWN_PEERS_CACHE_SIZE;
@@ -37,7 +43,6 @@ use static_assertions::const_assert;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::io::{Seek, SeekFrom};
 use std::num::{NonZeroU8, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -52,7 +57,9 @@ use subspace_core_primitives::{
     SegmentIndex,
 };
 use subspace_erasure_coding::ErasureCoding;
-use subspace_farmer_components::file_ext::{FileExt, OpenOptionsExt};
+use subspace_farmer_components::file_ext::FileExt;
+#[cfg(not(windows))]
+use subspace_farmer_components::file_ext::OpenOptionsExt;
 use subspace_farmer_components::plotting::PlottedSector;
 use subspace_farmer_components::sector::{sector_size, SectorMetadata, SectorMetadataChecksummed};
 use subspace_farmer_components::{FarmerProtocolInfo, PieceGetter};
@@ -304,7 +311,7 @@ pub enum SingleDiskFarmError {
     LikelyAlreadyInUse(io::Error),
     // TODO: Make more variants out of this generic one
     /// I/O error occurred
-    #[error("I/O error: {0}")]
+    #[error("Single disk farm I/O error: {0}")]
     Io(#[from] io::Error),
     /// Piece cache error
     #[error("Piece cache error: {0}")]
@@ -566,6 +573,7 @@ pub struct SingleDiskFarm {
     tasks: FuturesUnordered<BackgroundTask>,
     handlers: Arc<Handlers>,
     piece_cache: DiskPieceCache,
+    plot_cache: DiskPlotCache,
     piece_reader: PieceReader,
     /// Sender that will be used to signal to background threads that they should start
     start_sender: Option<broadcast::Sender<()>>,
@@ -621,6 +629,9 @@ impl SingleDiskFarm {
             disable_farm_locking,
         } = options;
         fs::create_dir_all(&directory)?;
+
+        let span = info_span!("", %disk_farm_index);
+        let span_guard = span.enter();
 
         let identity = Identity::open_or_create(&directory)?;
         let public_key = identity.public_key().to_bytes().into();
@@ -721,8 +732,8 @@ impl SingleDiskFarm {
                 / 100
                 * (100 - u64::from(cache_percentage.get()));
             // Do the rounding to make sure we have exactly as much space as fits whole number of
-            // sectors
-            potentially_plottable_space / single_sector_overhead
+            // sectors, account for disk sector size just in case
+            (potentially_plottable_space - DISK_SECTOR_SIZE as u64) / single_sector_overhead
         };
 
         if target_sector_count == 0 {
@@ -742,13 +753,18 @@ impl SingleDiskFarm {
                 allocated_space,
             });
         }
+        let plot_file_size = target_sector_count * sector_size as u64;
+        // Align plot file size for disk sector size
+        let plot_file_size =
+            plot_file_size.div_ceil(DISK_SECTOR_SIZE as u64) * DISK_SECTOR_SIZE as u64;
 
         // Remaining space will be used for caching purposes
         let cache_capacity = {
             let cache_space = allocated_space
                 - fixed_space_usage
-                - (target_sector_count * single_sector_overhead);
-            cache_space as usize / DiskPieceCache::element_size()
+                - plot_file_size
+                - (sector_metadata_size as u64 * target_sector_count);
+            (cache_space / u64::from(DiskPieceCache::element_size())) as u32
         };
         let target_sector_count = match SectorIndex::try_from(target_sector_count) {
             Ok(target_sector_count) if target_sector_count < SectorIndex::MAX => {
@@ -768,6 +784,7 @@ impl SingleDiskFarm {
         };
 
         let metadata_file_path = directory.join(Self::METADATA_FILE);
+        #[cfg(not(windows))]
         let mut metadata_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -775,11 +792,18 @@ impl SingleDiskFarm {
             .advise_random_access()
             .open(&metadata_file_path)?;
 
+        #[cfg(not(windows))]
         metadata_file.advise_random_access()?;
 
-        let metadata_size = metadata_file.seek(SeekFrom::End(0))?;
+        #[cfg(windows)]
+        let mut metadata_file = UnbufferedIoFileWindows::open(&metadata_file_path)?;
+
+        let metadata_size = metadata_file.size()?;
         let expected_metadata_size =
             RESERVED_PLOT_METADATA + sector_metadata_size as u64 * u64::from(target_sector_count);
+        // Align plot file size for disk sector size
+        let expected_metadata_size =
+            expected_metadata_size.div_ceil(DISK_SECTOR_SIZE as u64) * DISK_SECTOR_SIZE as u64;
         let metadata_header = if metadata_size == 0 {
             let metadata_header = PlotMetadataHeader {
                 version: 0,
@@ -863,26 +887,45 @@ impl SingleDiskFarm {
             Arc::new(RwLock::new(sectors_metadata))
         };
 
-        let plot_file = Arc::new(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .advise_random_access()
-                .open(directory.join(Self::PLOT_FILE))?,
-        );
+        #[cfg(not(windows))]
+        let mut plot_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .advise_random_access()
+            .open(directory.join(Self::PLOT_FILE))?;
 
+        #[cfg(not(windows))]
         plot_file.advise_random_access()?;
 
-        // Allocating the whole file (`set_len` below can create a sparse file, which will cause
-        // writes to fail later)
-        plot_file
-            .preallocate(sector_size as u64 * u64::from(target_sector_count))
-            .map_err(SingleDiskFarmError::CantPreallocatePlotFile)?;
-        // Truncating file (if necessary)
-        plot_file.set_len(sector_size as u64 * u64::from(target_sector_count))?;
+        #[cfg(windows)]
+        let mut plot_file = UnbufferedIoFileWindows::open(&directory.join(Self::PLOT_FILE))?;
+
+        if plot_file.size()? != plot_file_size {
+            // Allocating the whole file (`set_len` below can create a sparse file, which will cause
+            // writes to fail later)
+            plot_file
+                .preallocate(plot_file_size)
+                .map_err(SingleDiskFarmError::CantPreallocatePlotFile)?;
+            // Truncating file (if necessary)
+            plot_file.set_len(plot_file_size)?;
+
+            // TODO: Hack due to Windows bugs:
+            //  https://learn.microsoft.com/en-us/answers/questions/1608540/getfileinformationbyhandle-followed-by-read-with-f
+            if cfg!(windows) {
+                warn!("Farm was resized, farmer restart is needed for optimal performance!")
+            }
+        }
+
+        let plot_file = Arc::new(plot_file);
 
         let piece_cache = DiskPieceCache::open(&directory, cache_capacity)?;
+        let plot_cache = DiskPlotCache::new(
+            &plot_file,
+            &sectors_metadata,
+            target_sector_count,
+            sector_size,
+        );
 
         let (error_sender, error_receiver) = oneshot::channel();
         let error_sender = Arc::new(Mutex::new(Some(error_sender)));
@@ -912,8 +955,6 @@ impl SingleDiskFarm {
             let (sender, receiver) = oneshot::channel();
             (Some(sender), Some(receiver))
         };
-
-        let span = info_span!("", %disk_farm_index);
 
         let plotting_join_handle = tokio::task::spawn_blocking({
             let sectors_metadata = Arc::clone(&sectors_metadata);
@@ -1060,61 +1101,68 @@ impl SingleDiskFarm {
                     }
                 };
 
-                let handle = Handle::current();
-                let span = span.clone();
-                thread_pool.install(move || {
-                    let _span_guard = span.enter();
+                let farming_fut = async move {
+                    if start_receiver.recv().await.is_err() {
+                        // Dropped before starting
+                        return Ok(());
+                    }
 
-                    let farming_fut = async move {
-                        if start_receiver.recv().await.is_err() {
-                            // Dropped before starting
+                    if let Some(farming_delay) = delay_farmer_receiver {
+                        if farming_delay.await.is_err() {
+                            // Dropped before resolving
                             return Ok(());
                         }
+                    }
 
-                        if let Some(farming_delay) = delay_farmer_receiver {
-                            if farming_delay.await.is_err() {
-                                // Dropped before resolving
-                                return Ok(());
-                            }
+                    let plot = thread_pool.install(|| {
+                        #[cfg(windows)]
+                        {
+                            RayonFiles::open_with(
+                                &directory.join(Self::PLOT_FILE),
+                                UnbufferedIoFileWindows::open,
+                            )
                         }
+                        #[cfg(not(windows))]
+                        {
+                            RayonFiles::open(&directory.join(Self::PLOT_FILE))
+                        }
+                    })?;
+                    let plot_audit = PlotAudit::new(&plot);
 
-                        let plot = RayonFiles::open(&directory.join(Self::PLOT_FILE))?;
-                        let plot_audit = PlotAudit::new(&plot);
-
-                        let farming_options = FarmingOptions {
-                            public_key,
-                            reward_address,
-                            node_client,
-                            plot_audit,
-                            sectors_metadata,
-                            kzg,
-                            erasure_coding,
-                            handlers,
-                            modifying_sector_index,
-                            slot_info_notifications: slot_info_forwarder_receiver,
-                        };
-                        farming::<PosTable, _, _>(farming_options).await
+                    let farming_options = FarmingOptions {
+                        public_key,
+                        reward_address,
+                        node_client,
+                        plot_audit,
+                        sectors_metadata,
+                        kzg,
+                        erasure_coding,
+                        handlers,
+                        modifying_sector_index,
+                        slot_info_notifications: slot_info_forwarder_receiver,
+                        thread_pool,
                     };
+                    farming::<PosTable, _, _>(farming_options).await
+                };
 
-                    handle.block_on(async {
-                        select! {
-                            farming_result = farming_fut.fuse() => {
-                                if let Err(error) = farming_result
-                                    && let Some(error_sender) = error_sender.lock().take()
-                                    && let Err(error) = error_sender.send(error.into())
-                                {
-                                    error!(
-                                        %error,
-                                        "Farming failed to send error to background task",
-                                    );
-                                }
-                            }
-                            _ = stop_receiver.recv().fuse() => {
-                                // Nothing, just exit
+                Handle::current().block_on(async {
+                    select! {
+                        farming_result = farming_fut.fuse() => {
+                            if let Err(error) = farming_result
+                                && let Some(error_sender) = error_sender.lock().take()
+                                && let Err(error) = error_sender.send(error.into())
+                            {
+                                error!(
+                                    %error,
+                                    "Farming failed to send error to background task",
+                                );
                             }
                         }
-                    });
-                })
+                        _ = stop_receiver.recv().fuse() => {
+                            // Nothing, just exit
+                        }
+                    }
+                });
             }
         });
         let farming_join_handle = AsyncJoinOnDrop::new(farming_join_handle, false);
@@ -1181,6 +1229,8 @@ impl SingleDiskFarm {
             Ok(())
         }));
 
+        drop(span_guard);
+
         let farm = Self {
             farmer_protocol_info: farmer_app_info.protocol_info,
             single_disk_farm_info,
@@ -1191,6 +1241,7 @@ impl SingleDiskFarm {
             tasks,
             handlers,
             piece_cache,
+            plot_cache,
             piece_reader,
             start_sender: Some(start_sender),
             stop_sender: Some(stop_sender),
@@ -1222,11 +1273,16 @@ impl SingleDiskFarm {
     pub fn read_all_sectors_metadata(
         directory: &Path,
     ) -> io::Result<Vec<SectorMetadataChecksummed>> {
+        #[cfg(not(windows))]
         let mut metadata_file = OpenOptions::new()
             .read(true)
             .open(directory.join(Self::METADATA_FILE))?;
 
-        let metadata_size = metadata_file.seek(SeekFrom::End(0))?;
+        #[cfg(windows)]
+        let mut metadata_file =
+            UnbufferedIoFileWindows::open(&directory.join(Self::METADATA_FILE))?;
+
+        let metadata_size = metadata_file.size()?;
         let sector_metadata_size = SectorMetadataChecksummed::encoded_size();
 
         let mut metadata_header_bytes = vec![0; PlotMetadataHeader::encoded_size()];
@@ -1335,6 +1391,11 @@ impl SingleDiskFarm {
     /// Get piece cache instance
     pub fn piece_cache(&self) -> DiskPieceCache {
         self.piece_cache.clone()
+    }
+
+    /// Get plot cache instance
+    pub fn plot_cache(&self) -> DiskPlotCache {
+        self.plot_cache.clone()
     }
 
     /// Get piece reader to read plotted pieces later
@@ -1508,7 +1569,7 @@ impl SingleDiskFarm {
             // Error doesn't matter here
             let _ = metadata_file.advise_sequential_access();
 
-            let metadata_size = match metadata_file.seek(SeekFrom::End(0)) {
+            let metadata_size = match metadata_file.size() {
                 Ok(metadata_size) => metadata_size,
                 Err(error) => {
                     return Err(SingleDiskFarmScrubError::FailedToDetermineFileSize {
@@ -1609,7 +1670,7 @@ impl SingleDiskFarm {
             // Error doesn't matter here
             let _ = plot_file.advise_sequential_access();
 
-            let plot_size = match plot_file.seek(SeekFrom::End(0)) {
+            let plot_size = match plot_file.size() {
                 Ok(metadata_size) => metadata_size,
                 Err(error) => {
                     return Err(SingleDiskFarmScrubError::FailedToDetermineFileSize {
@@ -1876,7 +1937,7 @@ impl SingleDiskFarm {
             // Error doesn't matter here
             let _ = cache_file.advise_sequential_access();
 
-            let cache_size = match cache_file.seek(SeekFrom::End(0)) {
+            let cache_size = match cache_file.size() {
                 Ok(metadata_size) => metadata_size,
                 Err(error) => {
                     return Err(SingleDiskFarmScrubError::FailedToDetermineFileSize {
@@ -1887,14 +1948,14 @@ impl SingleDiskFarm {
             };
 
             let element_size = DiskPieceCache::element_size();
-            let number_of_cached_elements = cache_size / element_size as u64;
-            let dummy_element = vec![0; element_size];
+            let number_of_cached_elements = cache_size / u64::from(element_size);
+            let dummy_element = vec![0; element_size as usize];
             (0..number_of_cached_elements)
                 .into_par_iter()
-                .map_with(vec![0; element_size], |element, cache_offset| {
+                .map_with(vec![0; element_size as usize], |element, cache_offset| {
                     let _span_guard = span.enter();
 
-                    let offset = cache_offset * element_size as u64;
+                    let offset = cache_offset * u64::from(element_size);
                     if let Err(error) = cache_file.read_exact_at(element, offset) {
                         warn!(
                             path = %file.display(),
@@ -1908,7 +1969,7 @@ impl SingleDiskFarm {
                         if let Err(error) = cache_file.write_all_at(&dummy_element, offset) {
                             return Err(SingleDiskFarmScrubError::FailedToWriteBytes {
                                 file: file.clone(),
-                                size: element_size as u64,
+                                size: u64::from(element_size),
                                 offset,
                                 error,
                             });
@@ -1918,7 +1979,7 @@ impl SingleDiskFarm {
                     }
 
                     let (index_and_piece_bytes, expected_checksum) =
-                        element.split_at(element_size - mem::size_of::<Blake3Hash>());
+                        element.split_at(element_size as usize - mem::size_of::<Blake3Hash>());
                     let actual_checksum = blake3_hash(index_and_piece_bytes);
                     if actual_checksum != expected_checksum && element != &dummy_element {
                         warn!(
@@ -1931,7 +1992,7 @@ impl SingleDiskFarm {
                         if let Err(error) = cache_file.write_all_at(&dummy_element, offset) {
                             return Err(SingleDiskFarmScrubError::FailedToWriteBytes {
                                 file: file.clone(),
-                                size: element_size as u64,
+                                size: u64::from(element_size),
                                 offset,
                                 error,
                             });

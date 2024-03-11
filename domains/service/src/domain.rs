@@ -1,6 +1,6 @@
 use crate::providers::{BlockImportProvider, RpcProvider};
 use crate::transaction_pool::FullChainApiWrapper;
-use crate::{FullBackend, FullClient, RuntimeExecutor};
+use crate::{FullBackend, FullClient};
 use cross_domain_message_gossip::ChainTxPoolMsg;
 use domain_client_block_preprocessor::inherents::CreateInherentDataProvider;
 use domain_client_message_relayer::GossipMessageSink;
@@ -10,13 +10,17 @@ use domain_runtime_primitives::{Balance, Hash};
 use futures::channel::mpsc;
 use futures::Stream;
 use pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi;
-use sc_client_api::{BlockBackend, BlockImportNotification, BlockchainEvents, ProofProvider};
+use sc_client_api::{
+    AuxStore, BlockBackend, BlockImportNotification, BlockchainEvents, ExecutorProvider,
+    ProofProvider,
+};
 use sc_consensus::SharedBlockImport;
+use sc_domains::{ExtensionsFactory, RuntimeExecutor};
 use sc_network::NetworkPeers;
 use sc_rpc_api::DenyUnsafe;
 use sc_service::{
     BuildNetworkParams, Configuration as ServiceConfiguration, NetworkStarter, PartialComponents,
-    SpawnTasksParams, TFullBackend, TaskManager,
+    PruningMode, SpawnTasksParams, TFullBackend, TaskManager,
 };
 use sc_telemetry::{Telemetry, TelemetryWorker, TelemetryWorkerHandle};
 use sc_transaction_pool_api::OffchainTransactionPoolFactory;
@@ -28,12 +32,13 @@ use sp_blockchain::{HeaderBackend, HeaderMetadata};
 use sp_consensus::SyncOracle;
 use sp_consensus_slots::Slot;
 use sp_core::traits::SpawnEssentialNamed;
-use sp_core::{Decode, Encode};
+use sp_core::{Decode, Encode, H256};
 use sp_domains::core_api::DomainCoreApi;
 use sp_domains::{BundleProducerElectionApi, DomainId, DomainsApi, OperatorId};
 use sp_domains_fraud_proof::FraudProofApi;
 use sp_messenger::messages::ChainId;
 use sp_messenger::{MessengerApi, RelayerApi};
+use sp_mmr_primitives::MmrApi;
 use sp_offchain::OffchainWorkerApi;
 use sp_runtime::traits::{Block as BlockT, NumberFor};
 use sp_session::SessionKeys;
@@ -51,7 +56,7 @@ pub type DomainOperator<Block, CBlock, CClient, RuntimeApi> = Operator<
     CBlock,
     FullClient<Block, RuntimeApi>,
     CClient,
-    FullPool<CBlock, CClient, RuntimeApi>,
+    FullPool<RuntimeApi>,
     FullBackend<Block>,
     RuntimeExecutor,
 >;
@@ -81,7 +86,7 @@ where
         + TransactionPaymentRuntimeApi<Block, Balance>
         + DomainCoreApi<Block>
         + MessengerApi<Block, NumberFor<Block>>
-        + RelayerApi<Block, NumberFor<Block>>,
+        + RelayerApi<Block, NumberFor<Block>, CBlock::Hash>,
     AccountId: Encode + Decode,
 {
     /// Task manager.
@@ -103,12 +108,12 @@ where
     /// Operator.
     pub operator: DomainOperator<Block, CBlock, CClient, RuntimeApi>,
     /// Transaction pool
-    pub transaction_pool: Arc<FullPool<CBlock, CClient, RuntimeApi>>,
+    pub transaction_pool: Arc<FullPool<RuntimeApi>>,
     _phantom_data: PhantomData<AccountId>,
 }
 
-pub type FullPool<CBlock, CClient, RuntimeApi> =
-    crate::transaction_pool::FullPool<CClient, CBlock, Block, FullClient<Block, RuntimeApi>>;
+pub type FullPool<RuntimeApi> =
+    crate::transaction_pool::FullPool<Block, FullClient<Block, RuntimeApi>>;
 
 /// Constructs a partial domain node.
 #[allow(clippy::type_complexity)]
@@ -122,11 +127,11 @@ fn new_partial<RuntimeApi, CBlock, CClient, BIMP>(
         FullBackend<Block>,
         (),
         sc_consensus::DefaultImportQueue<Block>,
-        FullPool<CBlock, CClient, RuntimeApi>,
+        FullPool<RuntimeApi>,
         (
             Option<Telemetry>,
             Option<TelemetryWorkerHandle>,
-            RuntimeExecutor,
+            Arc<RuntimeExecutor>,
             SharedBlockImport<Block>,
         ),
     >,
@@ -142,7 +147,9 @@ where
         + Send
         + Sync
         + 'static,
-    CClient::Api: DomainsApi<CBlock, Header> + MessengerApi<CBlock, NumberFor<CBlock>>,
+    CClient::Api: DomainsApi<CBlock, Header>
+        + MessengerApi<CBlock, NumberFor<CBlock>>
+        + MmrApi<CBlock, H256, NumberFor<CBlock>>,
     RuntimeApi: ConstructRuntimeApi<Block, FullClient<Block, RuntimeApi>> + Send + Sync + 'static,
     RuntimeApi::RuntimeApi:
         TaggedTransactionQueue<Block> + MessengerApi<Block, NumberFor<Block>> + ApiExt<Block>,
@@ -168,6 +175,11 @@ where
     )?;
     let client = Arc::new(client);
 
+    let executor = Arc::new(executor);
+    client.execution_extensions().set_extensions_factory(
+        ExtensionsFactory::<_, CBlock, Block, _>::new(consensus_client.clone(), executor.clone()),
+    );
+
     let telemetry_worker_handle = telemetry.as_ref().map(|(worker, _)| worker.handle());
 
     let telemetry = telemetry.map(|(worker, telemetry)| {
@@ -177,12 +189,7 @@ where
         telemetry
     });
 
-    let transaction_pool = crate::transaction_pool::new_full(
-        config,
-        &task_manager,
-        client.clone(),
-        consensus_client.clone(),
-    );
+    let transaction_pool = crate::transaction_pool::new_full(config, &task_manager, client.clone());
 
     let block_import = SharedBlockImport::new(BlockImportProvider::block_import(
         block_import_provider,
@@ -225,6 +232,8 @@ where
     pub domain_message_receiver: TracingUnboundedReceiver<ChainTxPoolMsg>,
     pub provider: Provider,
     pub skip_empty_bundle_production: bool,
+    pub consensus_state_pruning: PruningMode,
+    pub skip_out_of_order_slot: bool,
 }
 
 /// Builds service for a domain full node.
@@ -261,14 +270,16 @@ where
         + ProofProvider<CBlock>
         + ProvideRuntimeApi<CBlock>
         + BlockchainEvents<CBlock>
+        + AuxStore
         + Send
         + Sync
         + 'static,
     CClient::Api: DomainsApi<CBlock, Header>
-        + RelayerApi<CBlock, NumberFor<CBlock>>
+        + RelayerApi<CBlock, NumberFor<CBlock>, CBlock::Hash>
         + MessengerApi<CBlock, NumberFor<CBlock>>
         + BundleProducerElectionApi<CBlock, subspace_runtime_primitives::Balance>
-        + FraudProofApi<CBlock, Header>,
+        + FraudProofApi<CBlock, Header>
+        + MmrApi<CBlock, H256, NumberFor<CBlock>>,
     IBNS: Stream<Item = (NumberFor<CBlock>, mpsc::Sender<()>)> + Send + 'static,
     CIBNS: Stream<Item = BlockImportNotification<CBlock>> + Send + 'static,
     NSNS: Stream<Item = (Slot, PotOutput)> + Send + 'static,
@@ -284,7 +295,7 @@ where
         + TaggedTransactionQueue<Block>
         + AccountNonceApi<Block, AccountId, Nonce>
         + TransactionPaymentRuntimeApi<Block, Balance>
-        + RelayerApi<Block, NumberFor<Block>>,
+        + RelayerApi<Block, NumberFor<Block>, CBlock::Hash>,
     AccountId: DeserializeOwned
         + Encode
         + Decode
@@ -298,8 +309,8 @@ where
     Provider: RpcProvider<
             Block,
             FullClient<Block, RuntimeApi>,
-            FullPool<CBlock, CClient, RuntimeApi>,
-            FullChainApiWrapper<CClient, CBlock, Block, FullClient<Block, RuntimeApi>>,
+            FullPool<RuntimeApi>,
+            FullChainApiWrapper<Block, FullClient<Block, RuntimeApi>>,
             TFullBackend<Block>,
             AccountId,
             CreateInherentDataProvider<CClient, CBlock>,
@@ -321,6 +332,8 @@ where
         domain_message_receiver,
         provider,
         skip_empty_bundle_production,
+        consensus_state_pruning,
+        skip_out_of_order_slot,
     } = domain_params;
 
     // TODO: Do we even need block announcement on domain node?
@@ -409,8 +422,6 @@ where
         telemetry: telemetry.as_mut(),
     })?;
 
-    let code_executor = Arc::new(code_executor);
-
     let spawn_essential = task_manager.spawn_essential_handle();
     let (bundle_sender, _bundle_receiver) = tracing_unbounded("domain_bundle_stream", 100);
 
@@ -441,13 +452,16 @@ where
             domain_confirmation_depth,
             block_import,
             skip_empty_bundle_production,
+            skip_out_of_order_slot,
         },
     )
     .await?;
 
     if is_authority {
         let relayer_worker = domain_client_message_relayer::worker::relay_domain_messages(
+            domain_id,
             consensus_client.clone(),
+            consensus_state_pruning,
             client.clone(),
             domain_state_pruning,
             // domain relayer will use consensus chain sync oracle instead of domain sync orcle

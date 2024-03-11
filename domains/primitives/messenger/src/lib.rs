@@ -20,14 +20,16 @@
 pub mod endpoint;
 pub mod messages;
 
-use crate::messages::BlockInfo;
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+use crate::messages::MessageKey;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use codec::{Decode, Encode};
-use messages::{
-    BlockMessagesWithStorageKey, ChainId, CrossDomainMessage, ExtractedStateRootsFromProof,
-    MessageId,
-};
-use sp_domains::DomainId;
-use sp_std::vec::Vec;
+use messages::{BlockMessagesWithStorageKey, CrossDomainMessage, MessageId};
+use sp_domains::{ChainId, DomainId};
+use sp_mmr_primitives::{EncodableOpaqueLeaf, Proof};
 
 /// Trait to handle XDM rewards.
 pub trait OnXDMRewards<Balance> {
@@ -38,30 +40,72 @@ impl<Balance> OnXDMRewards<Balance> for () {
     fn on_xdm_rewards(_: Balance) {}
 }
 
+/// Trait to verify MMR proofs
+pub trait MmrProofVerifier<MmrHash, StateRoot> {
+    /// Returns consensus state root if the given MMR proof is valid
+    fn verify_proof_and_extract_consensus_state_root(
+        leaf: EncodableOpaqueLeaf,
+        proof: Proof<MmrHash>,
+    ) -> Option<StateRoot>;
+}
+
+impl<MmrHash, StateRoot> MmrProofVerifier<MmrHash, StateRoot> for () {
+    fn verify_proof_and_extract_consensus_state_root(
+        _leaf: EncodableOpaqueLeaf,
+        _proof: Proof<MmrHash>,
+    ) -> Option<StateRoot> {
+        None
+    }
+}
+
+/// Trait that return various storage keys for storages on Consensus chain and domains
+pub trait StorageKeys {
+    /// Returns the storage key for confirmed domain block on conensus chain
+    fn confirmed_domain_block_storage_key(domain_id: DomainId) -> Option<Vec<u8>>;
+
+    /// Returns the outbox storage key for given chain.
+    fn outbox_storage_key(chain_id: ChainId, message_key: MessageKey) -> Option<Vec<u8>>;
+
+    /// Returns the inbox responses storage key for given chain.
+    fn inbox_responses_storage_key(chain_id: ChainId, message_key: MessageKey) -> Option<Vec<u8>>;
+}
+
+impl StorageKeys for () {
+    fn confirmed_domain_block_storage_key(_domain_id: DomainId) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn outbox_storage_key(_chain_id: ChainId, _message_key: MessageKey) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn inbox_responses_storage_key(
+        _chain_id: ChainId,
+        _message_key: MessageKey,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+}
+
 sp_api::decl_runtime_apis! {
     /// Api useful for relayers to fetch messages and submit transactions.
-    pub trait RelayerApi< BlockNumber>
+    pub trait RelayerApi<BlockNumber, CHash>
     where
-        BlockNumber: Encode + Decode
+        BlockNumber: Encode + Decode,
+        CHash: Encode + Decode,
     {
-        /// Returns the the chain_id of the Runtime.
-        fn chain_id() -> ChainId;
-
-        /// Returns the confirmation depth to relay message.
-        fn relay_confirmation_depth() -> BlockNumber;
-
         /// Returns all the outbox and inbox responses to deliver.
         /// Storage key is used to generate the storage proof for the message.
         fn block_messages() -> BlockMessagesWithStorageKey;
 
         /// Constructs an outbox message to the dst_chain as an unsigned extrinsic.
         fn outbox_message_unsigned(
-            msg: CrossDomainMessage<BlockNumber, Block::Hash, Block::Hash>,
+            msg: CrossDomainMessage<CHash, sp_core::H256>,
         ) -> Option<Block::Extrinsic>;
 
         /// Constructs an inbox response message to the dst_chain as an unsigned extrinsic.
         fn inbox_response_message_unsigned(
-            msg: CrossDomainMessage<BlockNumber, Block::Hash, Block::Hash>,
+            msg: CrossDomainMessage<CHash, sp_core::H256>,
         ) -> Option<Block::Extrinsic>;
 
         /// Returns true if the outbox message is ready to be relayed to dst_chain.
@@ -72,15 +116,22 @@ sp_api::decl_runtime_apis! {
     }
 
     /// Api to provide XDM extraction from Runtime Calls.
+    #[api_version(2)]
     pub trait MessengerApi<BlockNumber> where BlockNumber: Encode + Decode{
-        fn extract_xdm_proof_state_roots(
+        /// Returns `Some(true)` if valid XDM or `Some(false)` if not
+        /// Returns None if this is not an XDM
+        fn is_xdm_valid(
             extrinsic: Vec<u8>
-        ) -> Option<ExtractedStateRootsFromProof<BlockNumber, Block::Hash, Block::Hash>>;
+        ) -> Option<bool>;
 
-        fn is_domain_info_confirmed(
-            domain_id: DomainId,
-            domain_block_info: BlockInfo<BlockNumber, Block::Hash>,
-            domain_state_root: Block::Hash,
-        ) -> bool;
+
+        /// Returns the confirmed domain block storage for given domain.
+        fn confirmed_domain_block_storage_key(domain_id: DomainId) -> Vec<u8>;
+
+        /// Returns storage key for outbox for a given message_id.
+        fn outbox_storage_key(message_key: MessageKey) -> Vec<u8>;
+
+        /// Returns storage key for inbox response for a given message_id.
+        fn inbox_response_storage_key(message_key: MessageKey) -> Vec<u8>;
     }
 }

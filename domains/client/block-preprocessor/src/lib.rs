@@ -9,17 +9,16 @@
 //! 5. Push back the potential new domain runtime extrisnic.
 
 #![warn(rust_2018_idioms)]
+#![feature(let_chains)]
 
 pub mod inherents;
 pub mod stateless_runtime;
-pub mod xdm_verifier;
 
 use crate::inherents::is_runtime_upgraded;
-use crate::xdm_verifier::is_valid_xdm;
 use codec::Encode;
 use domain_runtime_primitives::opaque::AccountId;
 use sc_client_api::BlockBackend;
-use sp_api::ProvideRuntimeApi;
+use sp_api::{ApiExt, ProvideRuntimeApi};
 use sp_blockchain::HeaderBackend;
 use sp_core::H256;
 use sp_domains::core_api::DomainCoreApi;
@@ -298,6 +297,21 @@ where
                 ));
             }
 
+            // TODO: remove version check before next network
+            let messenger_api_version = runtime_api
+                .api_version::<dyn MessengerApi<Block, NumberFor<Block>>>(at)?
+                // safe to return default version as 1 since there will always be version 1.
+                .unwrap_or(1);
+
+            if messenger_api_version >= 2 {
+                // check if the extrinsic is an XDM and is valid
+                if let Some(false) = runtime_api.is_xdm_valid(at, extrinsic.encode())? {
+                    return Ok(BundleValidity::Invalid(InvalidBundleType::InvalidXDM(
+                        index as u32,
+                    )));
+                }
+            }
+
             // Using one instance of runtime_api throughout the loop in order to maintain context
             // between them.
             // Using `check_extrinsics_and_do_pre_dispatch` instead of `check_transaction_validity`
@@ -313,21 +327,6 @@ where
 
             if !is_legal_tx {
                 return Ok(BundleValidity::Invalid(InvalidBundleType::IllegalTx(
-                    index as u32,
-                )));
-            }
-
-            // TODO: the behavior is changed, as before invalid XDM will be dropped silently,
-            // and the other extrinsic of the bundle will be continue processed, now the whole
-            // bundle is considered as invalid and excluded from further processing.
-            if !is_valid_xdm::<CClient, CBlock, Block, _>(
-                &self.consensus_client,
-                at,
-                &self.client,
-                &extrinsic,
-            )? {
-                // TODO: Generate a fraud proof for this invalid bundle
-                return Ok(BundleValidity::Invalid(InvalidBundleType::InvalidXDM(
                     index as u32,
                 )));
             }

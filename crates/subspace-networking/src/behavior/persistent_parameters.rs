@@ -341,6 +341,7 @@ impl KnownPeersManager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
 
         let known_addresses_size = Self::known_addresses_size(cache_size);
@@ -737,7 +738,7 @@ pub(super) fn remove_known_peer_addresses_internal(
                     if let Some(time) = first_failed_time {
                         // if we failed first time more than an hour ago (for Kademlia)
                         if *time + expired_address_duration_kademlia < now {
-                            let address_removed = PeerAddressRemovedEvent{
+                            let address_removed = PeerAddressRemovedEvent {
                                 peer_id,
                                 address: addr.clone(),
                             };
