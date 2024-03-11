@@ -4,7 +4,7 @@ ARG RUSTC_VERSION=nightly-2024-02-29
 ARG PROFILE=production
 
 # Set Rust flags to ensure compatibility with older CPUs such as Xeon E5
-ARG RUSTFLAGS="-C target-cpu=x86-64 -C target-feature=+sse2,-sse4.1,-avx,-avx2 -C lto=thin"
+ARG RUSTFLAGS="-C target-cpu=x86-64 -C target-feature=+sse2,-sse4.1,-avx,-avx2"
 
 # Workaround for https://github.com/rust-lang/cargo/issues/10583
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
