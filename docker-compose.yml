@@ -90,7 +90,7 @@ services:
 
   farmer-1:
     depends_on:
-      node:
+      node-1:
         condition: service_healthy
     image: fragaly/subspace-farmer-oc:0.1.2
     volumes:
@@ -111,7 +111,7 @@ services:
 
   farmer-2:
     depends_on:
-      node:
+      node-2:
         condition: service_healthy
     image: fragaly/subspace-farmer-oc:0.1.2
     volumes:
@@ -132,7 +132,7 @@ services:
 
   farmer-3:
     depends_on:
-      node:
+      node-3:
         condition: service_healthy
     image: fragaly/subspace-farmer-oc:0.1.2
     volumes:
