@@ -105,7 +105,7 @@ services:
         "--node-rpc-url", "ws://node-1:9944",
         "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
         "--listen-on", "/ip4/0.0.0.0/tcp/30533",
-        "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L",
+        "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L", #TODO replace with you wallet
         "path=/var/subspace,size=100G"
       ]
 
@@ -126,7 +126,7 @@ services:
         "--node-rpc-url", "ws://node-2:9944",
         "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
         "--listen-on", "/ip4/0.0.0.0/tcp/30533",
-        "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L",
+        "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L", #TODO replace with you wallet
         "path=/var/subspace,size=100G"
       ]
 
@@ -147,7 +147,7 @@ services:
         "--node-rpc-url", "ws://node-3:9944",
         "--listen-on", "/ip4/0.0.0.0/udp/30533/quic-v1",
         "--listen-on", "/ip4/0.0.0.0/tcp/30533",
-        "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L",
+        "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L", #TODO replace with you wallet
         "path=/var/subspace,size=100G"
       ]
 
