@@ -33,7 +33,7 @@ services:
   node-2:
     image: fragaly/subspace-node-oc:0.1.2
     volumes:
-      - node-data-1:/var/subspace:rw
+      - node-data-2:/var/subspace:rw
     ports:
       - "0.0.0.0:30334:30333/udp"
       - "0.0.0.0:30334:30333/tcp"
@@ -62,7 +62,7 @@ services:
   node-3:
     image: fragaly/subspace-node-oc:0.1.2
     volumes:
-      - node-data-1:/var/subspace:rw
+      - node-data-3:/var/subspace:rw
     ports:
       - "0.0.0.0:30335:30333/udp"
       - "0.0.0.0:30335:30333/tcp"
@@ -150,7 +150,6 @@ services:
         "--reward-address", "st8KM6ittgMpVDoUDW5Q41EaQyNXmhemTj51jnPiXdAQZ4L6L", #TODO replace with you wallet
         "path=/var/subspace,size=100G"
       ]
-
 
 volumes:
   node-data-1:
